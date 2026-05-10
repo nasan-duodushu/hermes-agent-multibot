@@ -221,3 +221,63 @@ class TestBotAwareHomeChannelRouting:
             "hello",
             metadata={"thread_id": "platform-thread"},
         )
+
+    @pytest.mark.asyncio
+    async def test_delivery_dedupes_targets_that_resolve_to_same_bot_home_channel(self):
+        beta_adapter = AsyncMock()
+        beta_adapter.send = AsyncMock(return_value={"ok": True})
+
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: TelegramPlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform.TELEGRAM,
+                        chat_id="platform-home",
+                        name="Platform Home",
+                    ),
+                    bots=[
+                        TelegramBotConfig(
+                            id="beta",
+                            token="tok-b",
+                            home_channel=HomeChannel(
+                                platform=Platform.TELEGRAM,
+                                chat_id="beta-home",
+                                name="Beta Home",
+                                thread_id="beta-thread",
+                            ),
+                        )
+                    ],
+                )
+            }
+        )
+        router = DeliveryRouter(
+            config,
+            adapters={Platform.TELEGRAM: [beta_adapter]},
+        )
+        beta_adapter._bot_instance_id = "beta"
+
+        results = await router.deliver(
+            "hello",
+            [
+                DeliveryTarget(platform=Platform.TELEGRAM, bot_instance_id="beta"),
+                DeliveryTarget(
+                    platform=Platform.TELEGRAM,
+                    chat_id="beta-home",
+                    thread_id="beta-thread",
+                    bot_instance_id="beta",
+                ),
+            ],
+        )
+
+        beta_adapter.send.assert_awaited_once_with(
+            "beta-home",
+            "hello",
+            metadata={"thread_id": "beta-thread"},
+        )
+        assert results["telegram"]["success"] is True
+        assert results["telegram:beta-home:beta-thread"]["result"] == {
+            "skipped": True,
+            "reason": "duplicate_resolved_target",
+            "resolved_target": "telegram:beta-home:beta-thread",
+        }

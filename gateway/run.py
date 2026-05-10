@@ -7824,6 +7824,8 @@ class GatewayRunner:
             }
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
+            if event.source.bot_instance_id:
+                notify_data["bot_instance_id"] = event.source.bot_instance_id
             atomic_json_write(
                 _hermes_home / ".restart_notify.json",
                 notify_data,
@@ -8759,6 +8761,7 @@ class GatewayRunner:
         env_key = _home_target_env_var(platform_name)
         thread_env_key = _home_thread_env_var(platform_name)
         thread_id = source.thread_id
+        bot_instance_id = str(source.bot_instance_id).strip() if source.bot_instance_id else ""
 
         # Save to .env so it persists across restarts
         try:
@@ -8777,12 +8780,21 @@ class GatewayRunner:
                 source.platform,
                 PlatformConfig(enabled=True),
             )
-            platform_config.home_channel = HomeChannel(
+            home_channel = HomeChannel(
                 platform=source.platform,
                 chat_id=str(chat_id),
                 name=chat_name,
                 thread_id=str(thread_id) if thread_id else None,
             )
+            if bot_instance_id and hasattr(platform_config, "bots"):
+                for bot in getattr(platform_config, "bots", []):
+                    if str(getattr(bot, "id", "")).strip() == bot_instance_id:
+                        bot.home_channel = home_channel
+                        break
+                else:
+                    platform_config.home_channel = home_channel
+            else:
+                platform_config.home_channel = home_channel
 
         return (
             f"✅ Home channel set to **{chat_name}** (ID: {chat_id}).\n"
@@ -11841,16 +11853,31 @@ class GatewayRunner:
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
+            bot_instance_id = data.get("bot_instance_id")
 
             if not platform_str or not chat_id:
                 return None
 
             platform = Platform(platform_str)
             adapter = self.adapters.get(platform)
+            if isinstance(adapter, list):
+                if bot_instance_id:
+                    normalized_bot_id = str(bot_instance_id).strip()
+                    adapter = next(
+                        (
+                            candidate
+                            for candidate in adapter
+                            if str(getattr(candidate, "_bot_instance_id", "")).strip() == normalized_bot_id
+                        ),
+                        None,
+                    )
+                else:
+                    adapter = adapter[0] if adapter else None
             if not adapter:
                 logger.debug(
-                    "Restart notification skipped: %s adapter not connected",
+                    "Restart notification skipped: %s adapter not connected (bot=%s)",
                     platform_str,
+                    bot_instance_id,
                 )
                 return None
 

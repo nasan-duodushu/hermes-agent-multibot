@@ -45,6 +45,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     runner.request_restart = MagicMock(return_value=True)
 
     source = make_restart_source(chat_id="42")
+    source.bot_instance_id = "alpha"
     event = MessageEvent(
         text="/restart",
         message_type=MessageType.TEXT,
@@ -60,6 +61,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     data = json.loads(notify_path.read_text())
     assert data["platform"] == "telegram"
     assert data["chat_id"] == "42"
+    assert data["bot_instance_id"] == "alpha"
     assert "thread_id" not in data  # no thread → omitted
 
 
@@ -144,6 +146,7 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     runner.request_restart = MagicMock(return_value=True)
 
     source = make_restart_source(chat_id="42")
+    source.bot_instance_id = "alpha"
     event = MessageEvent(
         text="/restart",
         message_type=MessageType.TEXT,
@@ -156,6 +159,7 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     names = [name for name, _payload, _kwargs in calls]
     assert names == [".restart_notify.json", ".restart_last_processed.json"]
     assert calls[0][1]["chat_id"] == "42"
+    assert calls[0][1]["bot_instance_id"] == "alpha"
     assert calls[1][1]["platform"] == "telegram"
 
 
@@ -222,6 +226,65 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
     assert home is not None
     assert home.chat_id == "parent-42"
     assert home.thread_id == "topic-7"
+
+
+@pytest.mark.asyncio
+async def test_sethome_updates_bot_specific_home_channel_for_same_process_restart(
+    tmp_path, monkeypatch
+):
+    """/sethome on a specific bot updates that bot's in-memory home target only."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    saved = {}
+
+    def _fake_save_env_value(key, value):
+        saved[key] = value
+
+    monkeypatch.setattr("hermes_cli.config.save_env_value", _fake_save_env_value)
+
+    runner, _adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM] = TelegramPlatformConfig(
+        enabled=True,
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="platform-home",
+            name="Platform Home",
+        ),
+        bots=[
+            TelegramBotConfig(
+                id="alpha",
+                token="tok-a",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="alpha-old",
+                    name="Alpha Old",
+                ),
+            ),
+            TelegramBotConfig(id="beta", token="tok-b"),
+        ],
+    )
+    source = make_restart_source(chat_id="alpha-new", thread_id="topic-11")
+    source.bot_instance_id = "alpha"
+    source.chat_name = "Alpha Ops"
+    event = MessageEvent(
+        text="/sethome",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m-home-bot",
+    )
+
+    result = await runner._handle_set_home_command(event)
+
+    bot_home = runner.config.get_home_channel(Platform.TELEGRAM, bot_instance_id="alpha")
+    platform_home = runner.config.get_home_channel(Platform.TELEGRAM)
+    assert "Home channel set" in result
+    assert saved["TELEGRAM_HOME_CHANNEL"] == "alpha-new"
+    assert saved["TELEGRAM_HOME_CHANNEL_THREAD_ID"] == "topic-11"
+    assert bot_home is not None
+    assert bot_home.chat_id == "alpha-new"
+    assert bot_home.thread_id == "topic-11"
+    assert platform_home is not None
+    assert platform_home.chat_id == "platform-home"
 
 
 # ── home-channel startup notifications ─────────────────────────────────────
@@ -564,6 +627,43 @@ async def test_send_home_channel_startup_notification_uses_platform_home_when_bo
         "platform-home",
         "♻️ Gateway online — Hermes is back and ready.",
     )
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_routes_to_matching_bot_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps(
+            {
+                "platform": "telegram",
+                "chat_id": "beta-home",
+                "thread_id": "topic-9",
+                "bot_instance_id": "beta",
+            }
+        )
+    )
+
+    runner, _adapter = make_restart_runner()
+    alpha_adapter = MagicMock()
+    alpha_adapter._bot_instance_id = "alpha"
+    alpha_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="alpha"))
+    beta_adapter = MagicMock()
+    beta_adapter._bot_instance_id = "beta"
+    beta_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="beta"))
+    runner.adapters = {Platform.TELEGRAM: [alpha_adapter, beta_adapter]}
+
+    delivered = await runner._send_restart_notification()
+
+    assert delivered == ("telegram", "beta-home", "topic-9")
+    beta_adapter.send.assert_awaited_once_with(
+        "beta-home",
+        "♻ Gateway restarted successfully. Your session continues.",
+        metadata={"thread_id": "topic-9"},
+    )
+    alpha_adapter.send.assert_not_awaited()
+    assert not notify_path.exists()
 
 
 @pytest.mark.asyncio

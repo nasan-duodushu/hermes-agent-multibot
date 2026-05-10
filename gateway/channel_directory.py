@@ -37,10 +37,12 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
     chat_id = origin.get("chat_id")
     if not chat_id:
         return None
+    bot_instance_id = str(origin.get("bot_instance_id") or "").strip()
     thread_id = origin.get("thread_id")
+    base = f"{bot_instance_id}:{chat_id}" if bot_instance_id else str(chat_id)
     if thread_id:
-        return f"{chat_id}:{thread_id}"
-    return str(chat_id)
+        return f"{base}:{thread_id}"
+    return base
 
 
 def _session_entry_name(origin: Dict[str, Any]) -> str:

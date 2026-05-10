@@ -29,6 +29,7 @@ def mirror_to_session(
     source_label: str = "cli",
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    bot_instance_id: Optional[str] = None,
 ) -> bool:
     """
     Append a delivery-mirror message to the target session's transcript.
@@ -45,14 +46,16 @@ def mirror_to_session(
             str(chat_id),
             thread_id=thread_id,
             user_id=user_id,
+            bot_instance_id=bot_instance_id,
         )
         if not session_id:
             logger.debug(
-                "Mirror: no session found for %s:%s:%s:%s",
+                "Mirror: no session found for %s:%s:%s:%s:%s",
                 platform,
                 chat_id,
                 thread_id,
                 user_id,
+                bot_instance_id,
             )
             return False
 
@@ -72,11 +75,12 @@ def mirror_to_session(
 
     except Exception as e:
         logger.debug(
-            "Mirror failed for %s:%s:%s:%s: %s",
+            "Mirror failed for %s:%s:%s:%s:%s: %s",
             platform,
             chat_id,
             thread_id,
             user_id,
+            bot_instance_id,
             e,
         )
         return False
@@ -87,6 +91,7 @@ def _find_session_id(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    bot_instance_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Find the active session_id for a platform + chat_id pair.
@@ -122,6 +127,9 @@ def _find_session_id(
         if origin_chat_id == str(chat_id):
             origin_thread_id = origin.get("thread_id")
             if thread_id is not None and str(origin_thread_id or "") != str(thread_id):
+                continue
+            origin_bot_instance_id = str(origin.get("bot_instance_id") or "").strip()
+            if bot_instance_id is not None and origin_bot_instance_id != str(bot_instance_id).strip():
                 continue
             candidates.append(entry)
 

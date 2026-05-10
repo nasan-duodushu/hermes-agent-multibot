@@ -29,7 +29,7 @@ from .session import SessionSource
 class DeliveryTarget:
     """
     A single delivery target.
-    
+
     Represents where a message should be sent:
     - "origin" → back to source
     - "local" → save to local files
@@ -42,12 +42,21 @@ class DeliveryTarget:
     bot_instance_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
-    
+
+    def resolved_identity(self) -> tuple[Platform, Optional[str], Optional[str], Optional[str]]:
+        """Return a normalized identity tuple for deduping resolved targets."""
+        return (
+            self.platform,
+            str(self.chat_id) if self.chat_id is not None else None,
+            str(self.thread_id) if self.thread_id is not None else None,
+            str(self.bot_instance_id) if self.bot_instance_id is not None else None,
+        )
+
     @classmethod
     def parse(cls, target: str, origin: Optional[SessionSource] = None) -> "DeliveryTarget":
         """
         Parse a delivery target string.
-        
+
         Formats:
         - "origin" → back to source
         - "local" → local files only
@@ -56,7 +65,7 @@ class DeliveryTarget:
         """
         target_stripped = target.strip()
         target_lower = target_stripped.lower()
-        
+
         if target_lower == "origin":
             if origin:
                 return cls(
@@ -69,10 +78,10 @@ class DeliveryTarget:
             else:
                 # Fallback to local if no origin
                 return cls(platform=Platform.LOCAL, is_origin=True)
-        
+
         if target_lower == "local":
             return cls(platform=Platform.LOCAL)
-        
+
         # Check for platform:chat_id or platform:chat_id:thread_id format
         # Use the original case for chat_id/thread_id to preserve case-sensitive IDs
         if ":" in target_stripped:
@@ -86,7 +95,7 @@ class DeliveryTarget:
             except ValueError:
                 # Unknown platform, treat as local
                 return cls(platform=Platform.LOCAL)
-        
+
         # Just a platform name (use home channel)
         try:
             platform = Platform(target_lower)
@@ -94,7 +103,7 @@ class DeliveryTarget:
         except ValueError:
             # Unknown platform, treat as local
             return cls(platform=Platform.LOCAL)
-    
+
     def to_string(self) -> str:
         """Convert back to string format."""
         if self.is_origin:
@@ -111,15 +120,15 @@ class DeliveryTarget:
 class DeliveryRouter:
     """
     Routes messages to appropriate destinations.
-    
+
     Handles the logic of resolving delivery targets and dispatching
     messages to the right platform adapters.
     """
-    
+
     def __init__(self, config: GatewayConfig, adapters: Dict[Platform, Any] = None):
         """
         Initialize the delivery router.
-        
+
         Args:
             config: Gateway configuration
             adapters: Dict mapping platforms to their adapter instances
@@ -137,7 +146,26 @@ class DeliveryRouter:
                         return candidate
             return adapter[0] if adapter else None
         return adapter
-    
+
+    def _resolve_target(self, target: DeliveryTarget) -> DeliveryTarget:
+        """Resolve an abstract target to a concrete chat/thread/bot destination."""
+        resolved_target = target
+        if not resolved_target.chat_id:
+            home = self.config.get_home_channel(
+                resolved_target.platform,
+                bot_instance_id=resolved_target.bot_instance_id,
+            )
+            if home:
+                resolved_target = DeliveryTarget(
+                    platform=resolved_target.platform,
+                    chat_id=str(home.chat_id),
+                    thread_id=resolved_target.thread_id or home.thread_id,
+                    bot_instance_id=resolved_target.bot_instance_id,
+                    is_origin=resolved_target.is_origin,
+                    is_explicit=resolved_target.is_explicit,
+                )
+        return resolved_target
+
     async def deliver(
         self,
         content: str,
@@ -148,26 +176,41 @@ class DeliveryRouter:
     ) -> Dict[str, Any]:
         """
         Deliver content to all specified targets.
-        
+
         Args:
             content: The message/output to deliver
             targets: List of delivery targets
             job_id: Optional job ID (for cron jobs)
             job_name: Optional job name
             metadata: Additional metadata to include
-        
+
         Returns:
             Dict with delivery results per target
         """
         results = {}
-        
+        seen_resolved_targets = set()
+
         for target in targets:
             try:
-                if target.platform == Platform.LOCAL:
+                resolved_target = self._resolve_target(target)
+                resolved_identity = resolved_target.resolved_identity()
+                if resolved_identity in seen_resolved_targets:
+                    results[target.to_string()] = {
+                        "success": True,
+                        "result": {
+                            "skipped": True,
+                            "reason": "duplicate_resolved_target",
+                            "resolved_target": resolved_target.to_string(),
+                        }
+                    }
+                    continue
+                seen_resolved_targets.add(resolved_identity)
+
+                if resolved_target.platform == Platform.LOCAL:
                     result = self._deliver_local(content, job_id, job_name, metadata)
                 else:
-                    result = await self._deliver_to_platform(target, content, metadata)
-                
+                    result = await self._deliver_to_platform(resolved_target, content, metadata)
+
                 results[target.to_string()] = {
                     "success": True,
                     "result": result
@@ -177,9 +220,9 @@ class DeliveryRouter:
                     "success": False,
                     "error": str(e)
                 }
-        
+
         return results
-    
+
     def _deliver_local(
         self,
         content: str,
@@ -189,43 +232,43 @@ class DeliveryRouter:
     ) -> Dict[str, Any]:
         """Save content to local files."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         if job_id:
             output_path = self.output_dir / job_id / f"{timestamp}.md"
         else:
             output_path = self.output_dir / "misc" / f"{timestamp}.md"
-        
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Build the output document
         lines = []
         if job_name:
             lines.append(f"# {job_name}")
         else:
             lines.append("# Delivery Output")
-        
+
         lines.append("")
         lines.append(f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        
+
         if job_id:
             lines.append(f"**Job ID:** {job_id}")
-        
+
         if metadata:
             for key, value in metadata.items():
                 lines.append(f"**{key}:** {value}")
-        
+
         lines.append("")
         lines.append("---")
         lines.append("")
         lines.append(content)
-        
+
         output_path.write_text("\n".join(lines))
-        
+
         return {
             "path": str(output_path),
             "timestamp": timestamp
         }
-    
+
     def _save_full_output(self, content: str, job_id: str) -> Path:
         """Save full cron output to disk and return the file path."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -242,30 +285,16 @@ class DeliveryRouter:
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
-        resolved_target = target
-        if not resolved_target.chat_id:
-            home = self.config.get_home_channel(
-                resolved_target.platform,
-                bot_instance_id=resolved_target.bot_instance_id,
-            )
-            if home:
-                resolved_target = DeliveryTarget(
-                    platform=resolved_target.platform,
-                    chat_id=str(home.chat_id),
-                    thread_id=resolved_target.thread_id or home.thread_id,
-                    bot_instance_id=resolved_target.bot_instance_id,
-                    is_origin=resolved_target.is_origin,
-                    is_explicit=resolved_target.is_explicit,
-                )
+        resolved_target = self._resolve_target(target)
 
         adapter = self._select_adapter(resolved_target)
-        
+
         if not adapter:
             raise ValueError(f"No adapter configured for {resolved_target.platform.value}")
-        
+
         if not resolved_target.chat_id:
             raise ValueError(f"No chat ID for {resolved_target.platform.value} delivery")
-        
+
         # Guard: truncate oversized cron output to stay within platform limits
         if len(content) > MAX_PLATFORM_OUTPUT:
             job_id = (metadata or {}).get("job_id", "unknown")
@@ -275,12 +304,8 @@ class DeliveryRouter:
                 content[:TRUNCATED_VISIBLE]
                 + f"\n\n... [truncated, full output saved to {saved_path}]"
             )
-        
+
         send_metadata = dict(metadata or {})
         if resolved_target.thread_id and "thread_id" not in send_metadata:
             send_metadata["thread_id"] = resolved_target.thread_id
         return await adapter.send(resolved_target.chat_id, content, metadata=send_metadata or None)
-
-
-
-
