@@ -29,6 +29,7 @@ def make_collector() -> tuple[list[TopicUpdate], Any]:
 
 # ── subscribe / dispatch ─────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_dispatch_to_matching_handler(router: UpdateRouter) -> None:
     collected, handler = make_collector()
     router.subscribe("bot-1", "commands", handler)
@@ -41,6 +42,7 @@ async def test_dispatch_to_matching_handler(router: UpdateRouter) -> None:
     assert results == [None]  # no errors
 
 
+@pytest.mark.asyncio
 async def test_dispatch_no_match_returns_empty(router: UpdateRouter) -> None:
     collected, handler = make_collector()
     router.subscribe("bot-1", "commands", handler)
@@ -52,6 +54,7 @@ async def test_dispatch_no_match_returns_empty(router: UpdateRouter) -> None:
     assert collected == []
 
 
+@pytest.mark.asyncio
 async def test_dispatch_fan_out_multiple_handlers(router: UpdateRouter) -> None:
     c1, h1 = make_collector()
     c2, h2 = make_collector()
@@ -68,6 +71,7 @@ async def test_dispatch_fan_out_multiple_handlers(router: UpdateRouter) -> None:
 
 # ── bot-aware isolation ──────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_isolation_between_bots(router: UpdateRouter) -> None:
     """Handler for bot-A must NOT receive updates routed to bot-B."""
     c_a, h_a = make_collector()
@@ -84,6 +88,7 @@ async def test_isolation_between_bots(router: UpdateRouter) -> None:
 
 # ── subscribe_many ───────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_subscribe_many(router: UpdateRouter) -> None:
     collected, handler = make_collector()
     router.subscribe_many("bot-1", ["commands", "payments"], handler)
@@ -96,6 +101,7 @@ async def test_subscribe_many(router: UpdateRouter) -> None:
 
 # ── unsubscribe ──────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_unsubscribe_single(router: UpdateRouter) -> None:
     collected, handler = make_collector()
     router.subscribe("bot-1", "cmd", handler)
@@ -105,6 +111,7 @@ async def test_unsubscribe_single(router: UpdateRouter) -> None:
     assert collected == []
 
 
+@pytest.mark.asyncio
 async def test_unsubscribe_bot_removes_all(router: UpdateRouter) -> None:
     _, h1 = make_collector()
     _, h2 = make_collector()
@@ -117,6 +124,7 @@ async def test_unsubscribe_bot_removes_all(router: UpdateRouter) -> None:
 
 # ── idempotent subscribe ─────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_subscribe_idempotent(router: UpdateRouter) -> None:
     collected, handler = make_collector()
     router.subscribe("bot-1", "cmd", handler)
@@ -128,6 +136,7 @@ async def test_subscribe_idempotent(router: UpdateRouter) -> None:
 
 # ── error handling in dispatch ───────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_dispatch_captures_handler_error(router: UpdateRouter) -> None:
     async def bad_handler(update: TopicUpdate) -> None:
         raise RuntimeError("boom")
@@ -146,6 +155,7 @@ async def test_dispatch_captures_handler_error(router: UpdateRouter) -> None:
 
 # ── introspection ────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_topics_for_bot(router: UpdateRouter) -> None:
     _, h = make_collector()
     router.subscribe("bot-1", "a", h)
@@ -155,6 +165,7 @@ async def test_topics_for_bot(router: UpdateRouter) -> None:
     assert router.topics_for_bot("bot-2") == {"c"}
 
 
+@pytest.mark.asyncio
 async def test_handler_count(router: UpdateRouter) -> None:
     _, h1 = make_collector()
     _, h2 = make_collector()
