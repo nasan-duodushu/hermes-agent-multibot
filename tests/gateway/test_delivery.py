@@ -1,7 +1,11 @@
 """Tests for the delivery routing module."""
 
-from gateway.config import Platform
-from gateway.delivery import DeliveryTarget
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import GatewayConfig, HomeChannel, Platform, TelegramBotConfig, TelegramPlatformConfig
+from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.session import SessionSource
 
 
@@ -123,4 +127,97 @@ class TestPlatformNameCaseInsensitivity:
         assert target.chat_id == "12345"
 
 
+class TestBotAwareHomeChannelRouting:
+    @pytest.mark.asyncio
+    async def test_platform_target_uses_bot_specific_home_channel(self):
+        alpha_adapter = AsyncMock()
+        alpha_adapter.send = AsyncMock(return_value={"ok": True})
+        beta_adapter = AsyncMock()
+        beta_adapter.send = AsyncMock(return_value={"ok": True})
 
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: TelegramPlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform.TELEGRAM,
+                        chat_id="platform-home",
+                        name="Platform Home",
+                    ),
+                    bots=[
+                        TelegramBotConfig(
+                            id="alpha",
+                            token="tok-a",
+                            home_channel=HomeChannel(
+                                platform=Platform.TELEGRAM,
+                                chat_id="alpha-home",
+                                name="Alpha Home",
+                                thread_id="alpha-thread",
+                            ),
+                        ),
+                        TelegramBotConfig(
+                            id="beta",
+                            token="tok-b",
+                            home_channel=HomeChannel(
+                                platform=Platform.TELEGRAM,
+                                chat_id="beta-home",
+                                name="Beta Home",
+                            ),
+                        ),
+                    ],
+                )
+            }
+        )
+        router = DeliveryRouter(
+            config,
+            adapters={Platform.TELEGRAM: [alpha_adapter, beta_adapter]},
+        )
+        alpha_adapter._bot_instance_id = "alpha"
+        beta_adapter._bot_instance_id = "beta"
+
+        result = await router._deliver_to_platform(
+            DeliveryTarget(platform=Platform.TELEGRAM, bot_instance_id="beta"),
+            "hello",
+            metadata=None,
+        )
+
+        assert result == {"ok": True}
+        beta_adapter.send.assert_awaited_once_with("beta-home", "hello", metadata=None)
+        alpha_adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_platform_target_falls_back_to_platform_home_when_bot_has_no_override(self):
+        alpha_adapter = AsyncMock()
+        alpha_adapter.send = AsyncMock(return_value={"ok": True})
+
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: TelegramPlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform.TELEGRAM,
+                        chat_id="platform-home",
+                        name="Platform Home",
+                        thread_id="platform-thread",
+                    ),
+                    bots=[TelegramBotConfig(id="alpha", token="tok-a")],
+                )
+            }
+        )
+        router = DeliveryRouter(
+            config,
+            adapters={Platform.TELEGRAM: [alpha_adapter]},
+        )
+        alpha_adapter._bot_instance_id = "alpha"
+
+        await router._deliver_to_platform(
+            DeliveryTarget(platform=Platform.TELEGRAM, bot_instance_id="alpha"),
+            "hello",
+            metadata=None,
+        )
+
+        alpha_adapter.send.assert_awaited_once_with(
+            "platform-home",
+            "hello",
+            metadata={"thread_id": "platform-thread"},
+        )

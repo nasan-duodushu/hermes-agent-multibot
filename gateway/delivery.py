@@ -39,6 +39,7 @@ class DeliveryTarget:
     platform: Platform
     chat_id: Optional[str] = None  # None means use home channel
     thread_id: Optional[str] = None
+    bot_instance_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
     
@@ -62,6 +63,7 @@ class DeliveryTarget:
                     platform=origin.platform,
                     chat_id=origin.chat_id,
                     thread_id=origin.thread_id,
+                    bot_instance_id=origin.bot_instance_id,
                     is_origin=True,
                 )
             else:
@@ -125,6 +127,16 @@ class DeliveryRouter:
         self.config = config
         self.adapters = adapters or {}
         self.output_dir = get_hermes_home() / "cron" / "output"
+
+    def _select_adapter(self, target: DeliveryTarget):
+        adapter = self.adapters.get(target.platform)
+        if isinstance(adapter, list):
+            if target.bot_instance_id:
+                for candidate in adapter:
+                    if getattr(candidate, "_bot_instance_id", None) == target.bot_instance_id:
+                        return candidate
+            return adapter[0] if adapter else None
+        return adapter
     
     async def deliver(
         self,
@@ -230,13 +242,29 @@ class DeliveryRouter:
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
-        adapter = self.adapters.get(target.platform)
+        resolved_target = target
+        if not resolved_target.chat_id:
+            home = self.config.get_home_channel(
+                resolved_target.platform,
+                bot_instance_id=resolved_target.bot_instance_id,
+            )
+            if home:
+                resolved_target = DeliveryTarget(
+                    platform=resolved_target.platform,
+                    chat_id=str(home.chat_id),
+                    thread_id=resolved_target.thread_id or home.thread_id,
+                    bot_instance_id=resolved_target.bot_instance_id,
+                    is_origin=resolved_target.is_origin,
+                    is_explicit=resolved_target.is_explicit,
+                )
+
+        adapter = self._select_adapter(resolved_target)
         
         if not adapter:
-            raise ValueError(f"No adapter configured for {target.platform.value}")
+            raise ValueError(f"No adapter configured for {resolved_target.platform.value}")
         
-        if not target.chat_id:
-            raise ValueError(f"No chat ID for {target.platform.value} delivery")
+        if not resolved_target.chat_id:
+            raise ValueError(f"No chat ID for {resolved_target.platform.value} delivery")
         
         # Guard: truncate oversized cron output to stay within platform limits
         if len(content) > MAX_PLATFORM_OUTPUT:
@@ -249,9 +277,9 @@ class DeliveryRouter:
             )
         
         send_metadata = dict(metadata or {})
-        if target.thread_id and "thread_id" not in send_metadata:
-            send_metadata["thread_id"] = target.thread_id
-        return await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        if resolved_target.thread_id and "thread_id" not in send_metadata:
+            send_metadata["thread_id"] = resolved_target.thread_id
+        return await adapter.send(resolved_target.chat_id, content, metadata=send_metadata or None)
 
 
 

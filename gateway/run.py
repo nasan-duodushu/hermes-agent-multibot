@@ -585,7 +585,7 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(*, requested_provider: Optional[str] = None, target_model: Optional[str] = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
     If the primary provider fails with an authentication error, attempt to
@@ -600,13 +600,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
     try:
         runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            requested=requested_provider or os.getenv("HERMES_INFERENCE_PROVIDER"),
+            target_model=target_model,
         )
     except AuthError as auth_exc:
         # Primary provider auth failed (expired token, revoked key, etc.).
         # Try the fallback provider chain before raising.
         logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
+        fb_config = _try_resolve_fallback_provider(target_model=target_model)
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
@@ -624,7 +625,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _try_resolve_fallback_provider() -> dict | None:
+def _try_resolve_fallback_provider(*, target_model: Optional[str] = None) -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
@@ -647,6 +648,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     requested=entry.get("provider"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=entry.get("api_key"),
+                    target_model=target_model or entry.get("model"),
                 )
                 logger.info(
                     "Fallback provider resolved: %s model=%s",
@@ -876,7 +878,7 @@ def _load_gateway_config() -> dict:
     return {}
 
 
-def _resolve_gateway_model(config: dict | None = None) -> str:
+def _resolve_gateway_model(config: dict | None = None, source: Optional[SessionSource] = None) -> str:
     """Read model from config.yaml — single source of truth.
 
     Without this, temporary AIAgent instances (e.g. /compress) fall
@@ -885,6 +887,26 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     """
     cfg = config if config is not None else _load_gateway_config()
     model_cfg = cfg.get("model", {})
+    if source and isinstance(model_cfg, dict):
+        bot_cfg = None
+        platforms_cfg = cfg.get("platforms")
+        if isinstance(platforms_cfg, dict):
+            telegram_cfg = platforms_cfg.get("telegram")
+            if isinstance(telegram_cfg, dict):
+                bots = telegram_cfg.get("bots")
+                if isinstance(bots, list):
+                    wanted_bot_id = str(getattr(source, "bot_instance_id", "") or "").strip()
+                    for item in bots:
+                        if not isinstance(item, dict):
+                            continue
+                        item_id = str(item.get("id") or item.get("bot_id") or "default").strip() or "default"
+                        if item_id == wanted_bot_id:
+                            bot_cfg = item
+                            break
+        if isinstance(bot_cfg, dict):
+            bot_model = bot_cfg.get("model") or bot_cfg.get("default_model") or ""
+            if isinstance(bot_model, str) and bot_model.strip():
+                return bot_model.strip()
     if isinstance(model_cfg, str):
         return model_cfg
     elif isinstance(model_cfg, dict):
@@ -923,9 +945,10 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
     Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
-    Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
-    optionally ``thread_id`` keys, or None if the key doesn't match.
+    ``agent:{bot_instance_id}:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
+    Returns a dict with ``bot_instance_id``, ``platform``, ``chat_type``,
+    ``chat_id``, and optionally ``thread_id`` keys, or None if the key
+    doesn't match.
 
     The 6th element is only returned as ``thread_id`` for chat types where
     it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
@@ -933,14 +956,26 @@ def _parse_session_key(session_key: str) -> "dict | None":
     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
-    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+    if len(parts) >= 5 and parts[0] == "agent":
+        if len(parts) == 5:
+            bot_instance_id = parts[1] or "main"
+            platform_idx = 2
+        elif parts[1] == "main":
+            bot_instance_id = "main"
+            platform_idx = 2
+        elif len(parts) >= 6:
+            bot_instance_id = parts[1] or "main"
+            platform_idx = 2
+        else:
+            return None
         result = {
-            "platform": parts[2],
-            "chat_type": parts[3],
-            "chat_id": parts[4],
+            "bot_instance_id": bot_instance_id,
+            "platform": parts[platform_idx],
+            "chat_type": parts[platform_idx + 1],
+            "chat_id": parts[platform_idx + 2],
         }
-        if len(parts) > 5 and parts[3] in ("dm", "thread"):
-            result["thread_id"] = parts[5]
+        if len(parts) > platform_idx + 3 and parts[platform_idx + 1] in ("dm", "thread"):
+            result["thread_id"] = parts[platform_idx + 3]
         return result
     return None
 
@@ -1072,6 +1107,8 @@ class GatewayRunner:
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._platform_adapters: Dict[Platform, List[BasePlatformAdapter]] = {}
+        self._adapter_keys: Dict[BasePlatformAdapter, str] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -1640,7 +1677,7 @@ class GatewayRunner:
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(user_config)
+        model = _resolve_gateway_model(user_config, source=source)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -1670,7 +1707,10 @@ class GatewayRunner:
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_kwargs = _resolve_runtime_agent_kwargs(
+            requested_provider=(override or {}).get("provider"),
+            target_model=(override or {}).get("model") or model,
+        )
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -1770,8 +1810,7 @@ class GatewayRunner:
             try:
                 await adapter.disconnect()
             finally:
-                self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+                self._unregister_adapter(adapter)
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -1826,6 +1865,34 @@ class GatewayRunner:
 
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
+
+    def _adapter_instance_key(self, adapter: BasePlatformAdapter) -> str:
+        bot_instance_id = getattr(adapter, "_bot_instance_id", None)
+        if bot_instance_id:
+            return f"{adapter.platform.value}/{bot_instance_id}"
+        return adapter.platform.value
+
+    def _register_adapter(self, adapter: BasePlatformAdapter) -> None:
+        key = self._adapter_instance_key(adapter)
+        siblings = self._platform_adapters.setdefault(adapter.platform, [])
+        siblings.append(adapter)
+        self._adapter_keys[adapter] = key
+        if adapter.platform not in self.adapters:
+            self.adapters[adapter.platform] = adapter
+        self.delivery_router.adapters = self.adapters
+
+    def _unregister_adapter(self, adapter: BasePlatformAdapter) -> None:
+        siblings = self._platform_adapters.get(adapter.platform, [])
+        if adapter in siblings:
+            siblings.remove(adapter)
+        self._adapter_keys.pop(adapter, None)
+        if siblings:
+            self.adapters[adapter.platform] = siblings[0]
+            self._platform_adapters[adapter.platform] = siblings
+        else:
+            self._platform_adapters.pop(adapter.platform, None)
+            self.adapters.pop(adapter.platform, None)
+        self.delivery_router.adapters = self.adapters
 
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
@@ -3166,101 +3233,110 @@ class GatewayRunner:
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
                 continue
-            enabled_platform_count += 1
-            
-            adapter = self._create_adapter(platform, platform_config)
-            if not adapter:
-                # Distinguish between missing builtin deps and missing plugin
-                _pval = platform.value
-                _builtin_names = {m.value for m in Platform.__members__.values()}
-                if _pval not in _builtin_names:
-                    logger.warning(
-                        "No adapter for '%s' — is the plugin installed? "
-                        "(platform is enabled in config.yaml but no plugin registered it)",
-                        _pval,
-                    )
-                else:
-                    logger.warning("No adapter available for %s", _pval)
-                continue
-            
-            # Set up message + fatal error handlers
-            adapter.set_message_handler(self._handle_message)
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            
-            # Try to connect
-            logger.info("Connecting to %s...", platform.value)
-            self._update_platform_runtime_status(
-                platform.value,
-                platform_state="connecting",
-                error_code=None,
-                error_message=None,
-            )
-            try:
-                success = await self._connect_adapter_with_timeout(adapter, platform)
-                if success:
-                    self.adapters[platform] = adapter
-                    self._sync_voice_mode_state_to_adapter(adapter)
-                    connected_count += 1
+
+            platform_instances = []
+            if platform == Platform.TELEGRAM and hasattr(platform_config, "iter_enabled_bots"):
+                for bot_cfg in platform_config.iter_enabled_bots():
+                    platform_instances.append((bot_cfg.id, bot_cfg))
+            else:
+                platform_instances.append((None, platform_config))
+
+            for instance_id, instance_config in platform_instances:
+                enabled_platform_count += 1
+
+                adapter = self._create_adapter(platform, instance_config, instance_id=instance_id)
+                if not adapter:
+                    # Distinguish between missing builtin deps and missing plugin
+                    _pval = platform.value
+                    _builtin_names = {m.value for m in Platform.__members__.values()}
+                    if _pval not in _builtin_names:
+                        logger.warning(
+                            "No adapter for '%s' — is the plugin installed? "
+                            "(platform is enabled in config.yaml but no plugin registered it)",
+                            _pval,
+                        )
+                    else:
+                        logger.warning("No adapter available for %s", _pval)
+                    continue
+
+                # Set up message + fatal error handlers
+                adapter.set_message_handler(self._handle_message)
+                adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                adapter.set_session_store(self.session_store)
+                adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+
+                # Try to connect
+                logger.info("Connecting to %s...", platform.value)
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="connecting",
+                    error_code=None,
+                    error_message=None,
+                )
+                try:
+                    success = await self._connect_adapter_with_timeout(adapter, platform)
+                    if success:
+                        self._register_adapter(adapter)
+                        self._sync_voice_mode_state_to_adapter(adapter)
+                        connected_count += 1
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="connected",
+                            error_code=None,
+                            error_message=None,
+                        )
+                        logger.info("✓ %s connected", platform.value)
+                    else:
+                        logger.warning("✗ %s failed to connect", platform.value)
+                        # Defensive cleanup: a failed connect() may have
+                        # allocated resources (aiohttp.ClientSession, poll
+                        # tasks, bridge subprocesses) before giving up.
+                        # Without this call, those resources are orphaned
+                        # and Python logs 'Unclosed client session' on exit.
+                        try:
+                            await adapter.disconnect()
+                        except Exception:
+                            logger.debug(
+                                "Cleanup after failed %s connect also failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+                except Exception as e:
                     self._update_platform_runtime_status(
                         platform.value,
-                        platform_state="connected",
-                        error_code=None,
-                        error_message=None,
+                        platform_state="fatal",
+                        error_code=getattr(adapter, "fatal_error_code", None) or type(e).__name__,
+                        error_message=str(e),
                     )
-                    logger.info("✓ %s connected", platform.value)
-                else:
-                    logger.warning("✗ %s failed to connect", platform.value)
-                    # Defensive cleanup: a failed connect() may have
-                    # allocated resources (aiohttp.ClientSession, poll
-                    # tasks, bridge subprocesses) before giving up.
-                    # Without this call, those resources are orphaned
-                    # and Python logs "Unclosed client session" at
-                    # process exit. Adapter disconnect() implementations
-                    # are expected to be idempotent and tolerate
-                    # partial-init state.
-                    await self._safe_adapter_disconnect(adapter, platform)
-                    if adapter.has_fatal_error:
-                        self._update_platform_runtime_status(
-                            platform.value,
-                            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
-                            error_code=adapter.fatal_error_code,
-                            error_message=adapter.fatal_error_message,
-                        )
-                        target = (
-                            startup_retryable_errors
-                            if adapter.fatal_error_retryable
-                            else startup_nonretryable_errors
-                        )
-                        target.append(
-                            f"{platform.value}: {adapter.fatal_error_message}"
-                        )
-                        # Queue for reconnection if the error is retryable
-                        if adapter.fatal_error_retryable:
-                            self._failed_platforms[platform] = {
-                                "config": platform_config,
-                                "attempts": 1,
-                                "next_retry": time.monotonic() + 30,
-                            }
-                    else:
-                        self._update_platform_runtime_status(
-                            platform.value,
-                            platform_state="retrying",
-                            error_code=None,
-                            error_message="failed to connect",
-                        )
-                        startup_retryable_errors.append(
-                            f"{platform.value}: failed to connect"
-                        )
-                        # No fatal error info means likely a transient issue — queue for retry
+                    logger.error("Failed to connect %s: %s", platform.value, e)
+                    # Retryable startup failures should not permanently disable
+                    # the gateway; queue them for the background reconnector.
+                    # This mirrors runtime fatal-error handling and fixes cases
+                    # like transient DNS failure at boot (#2406).
+                    try:
+                        retryable = is_retryable_startup_error(e)
+                    except Exception:
+                        retryable = False
+                    if retryable:
                         self._failed_platforms[platform] = {
                             "config": platform_config,
-                            "attempts": 1,
+                            "attempts": 0,
                             "next_retry": time.monotonic() + 30,
                         }
-            except Exception as e:
-                logger.error("✗ %s error: %s", platform.value, e)
+                        logger.info(
+                            "%s queued for background reconnection after startup failure",
+                            platform.value,
+                        )
+                    # Defensive cleanup after exception during connect
+                    try:
+                        await adapter.disconnect()
+                    except Exception:
+                        logger.debug(
+                            "Cleanup after startup exception for %s failed",
+                            platform.value,
+                            exc_info=True,
+                        )
+
                 # Same defensive cleanup path for exceptions — an adapter
                 # that raised mid-connect may still have a live
                 # aiohttp.ClientSession or child subprocess.
@@ -4438,7 +4514,8 @@ class GatewayRunner:
     def _create_adapter(
         self, 
         platform: Platform, 
-        config: Any
+        config: Any,
+        instance_id: Optional[str] = None,
     ) -> Optional[BasePlatformAdapter]:
         """Create the appropriate adapter for a platform.
 
@@ -4479,7 +4556,7 @@ class GatewayRunner:
             if not check_telegram_requirements():
                 logger.warning("Telegram: python-telegram-bot not installed")
                 return None
-            return TelegramAdapter(config)
+            return TelegramAdapter(config, bot_instance_id=instance_id or "default")
         
         elif platform == Platform.DISCORD:
             from gateway.platforms.discord import DiscordAdapter, check_discord_requirements
@@ -11832,7 +11909,10 @@ class GatewayRunner:
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
-            home = self.config.get_home_channel(platform)
+            home = self.config.get_home_channel(
+                platform,
+                bot_instance_id=getattr(adapter, "_bot_instance_id", None),
+            )
             if not home or not home.chat_id:
                 continue
 
@@ -12156,6 +12236,7 @@ class GatewayRunner:
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            bot_instance_id=str(evt.get("bot_instance_id") or _parsed.get("bot_instance_id") if _parsed else "").strip() or None,
         )
 
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:

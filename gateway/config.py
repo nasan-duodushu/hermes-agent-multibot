@@ -317,6 +317,118 @@ class PlatformConfig:
 
 
 @dataclass
+class TelegramBotConfig:
+    """Per-bot Telegram configuration for single-instance multi-bot runtimes."""
+
+    id: str = "default"
+    token: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: bool = True
+    home_channel: Optional[HomeChannel] = None
+    reply_to_mode: str = "first"
+    gateway_restart_notification: bool = True
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "id": self.id,
+            "enabled": self.enabled,
+            "reply_to_mode": self.reply_to_mode,
+            "gateway_restart_notification": self.gateway_restart_notification,
+            "extra": self.extra,
+        }
+        if self.token:
+            result["token"] = self.token
+        if self.api_key:
+            result["api_key"] = self.api_key
+        if self.home_channel:
+            result["home_channel"] = self.home_channel.to_dict()
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TelegramBotConfig":
+        home_channel = None
+        if "home_channel" in data and isinstance(data["home_channel"], dict):
+            home_channel = HomeChannel.from_dict(data["home_channel"])
+
+        bot_id = str(data.get("id") or data.get("bot_id") or "default").strip() or "default"
+        return cls(
+            id=bot_id,
+            token=data.get("token"),
+            api_key=data.get("api_key"),
+            enabled=_coerce_bool(data.get("enabled"), True),
+            home_channel=home_channel,
+            reply_to_mode=(data.get("reply_to_mode") or "first"),
+            gateway_restart_notification=_coerce_bool(
+                data.get("gateway_restart_notification"), True
+            ),
+            extra=dict(data.get("extra", {}) or {}),
+        )
+
+
+@dataclass
+class TelegramPlatformConfig(PlatformConfig):
+    """Telegram platform config that can host multiple bot definitions."""
+
+    bots: List[TelegramBotConfig] = field(default_factory=list)
+
+    def iter_enabled_bots(self) -> List[TelegramBotConfig]:
+        return [
+            bot
+            for bot in self.bots
+            if bot.enabled and bool((bot.token or "").strip() or (bot.api_key or "").strip())
+        ]
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = super().to_dict()
+        result["bots"] = [bot.to_dict() for bot in self.bots]
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TelegramPlatformConfig":
+        base = PlatformConfig.from_dict(data)
+        bots_data = data.get("bots")
+        bots: List[TelegramBotConfig] = []
+        if isinstance(bots_data, list):
+            bots = [
+                TelegramBotConfig.from_dict(item)
+                for item in bots_data
+                if isinstance(item, dict)
+            ]
+        else:
+            legacy_extra = dict(base.extra or {})
+            bots = [
+                TelegramBotConfig(
+                    id="default",
+                    token=base.token,
+                    api_key=base.api_key,
+                    enabled=base.enabled,
+                    home_channel=base.home_channel,
+                    reply_to_mode=base.reply_to_mode,
+                    gateway_restart_notification=base.gateway_restart_notification,
+                    extra=legacy_extra,
+                )
+            ] if (
+                base.token
+                or base.api_key
+                or base.home_channel is not None
+                or base.extra
+                or base.enabled
+            ) else []
+
+        return cls(
+            enabled=base.enabled,
+            token=base.token,
+            api_key=base.api_key,
+            home_channel=base.home_channel,
+            reply_to_mode=base.reply_to_mode,
+            gateway_restart_notification=base.gateway_restart_notification,
+            extra=base.extra,
+            bots=bots,
+        )
+
+
+@dataclass
 class StreamingConfig:
     """Configuration for real-time token streaming to messaging platforms."""
     enabled: bool = False
@@ -488,12 +600,23 @@ class GatewayConfig:
 
         return False
     
-    def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
-        """Get the home channel for a platform."""
+    def get_home_channel(
+        self,
+        platform: Platform,
+        bot_instance_id: Optional[str] = None,
+    ) -> Optional[HomeChannel]:
+        """Get the home channel for a platform, optionally scoped to a bot instance."""
         config = self.platforms.get(platform)
-        if config:
-            return config.home_channel
-        return None
+        if not config:
+            return None
+
+        if platform == Platform.TELEGRAM and bot_instance_id and isinstance(config, TelegramPlatformConfig):
+            normalized_bot_id = str(bot_instance_id).strip()
+            for bot in config.bots:
+                if str(bot.id).strip() == normalized_bot_id and bot.home_channel:
+                    return bot.home_channel
+
+        return config.home_channel
     
     def get_reset_policy(
         self, 
@@ -545,7 +668,10 @@ class GatewayConfig:
         for platform_name, platform_data in data.get("platforms", {}).items():
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
+                if platform == Platform.TELEGRAM:
+                    platforms[platform] = TelegramPlatformConfig.from_dict(platform_data)
+                else:
+                    platforms[platform] = PlatformConfig.from_dict(platform_data)
             except ValueError:
                 pass  # Skip unknown platforms
         
@@ -785,6 +911,15 @@ def load_gateway_config() -> GatewayConfig:
                     platforms_data[plat.value] = plat_data
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
+                if "token" in platform_cfg:
+                    plat_data["token"] = platform_cfg["token"]
+                if "api_key" in platform_cfg:
+                    plat_data["api_key"] = platform_cfg["api_key"]
+                if "reply_to_mode" in platform_cfg:
+                    _rtm = platform_cfg["reply_to_mode"]
+                    plat_data["reply_to_mode"] = "off" if _rtm is False else str(_rtm).lower()
+                if "home_channel" in platform_cfg:
+                    plat_data["home_channel"] = platform_cfg["home_channel"]
                 extra = plat_data.setdefault("extra", {})
                 if not isinstance(extra, dict):
                     extra = {}
@@ -1136,19 +1271,60 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
     
     # Telegram
+    telegram_bots_json = os.getenv("TELEGRAM_BOTS_JSON", "").strip()
+    if telegram_bots_json:
+        try:
+            parsed = json.loads(telegram_bots_json)
+        except Exception as exc:
+            logger.warning("Failed to parse TELEGRAM_BOTS_JSON: %s", exc)
+        else:
+            if isinstance(parsed, list):
+                telegram_cfg = config.platforms.get(Platform.TELEGRAM)
+                if not isinstance(telegram_cfg, TelegramPlatformConfig):
+                    telegram_cfg = TelegramPlatformConfig.from_dict(
+                        telegram_cfg.to_dict() if isinstance(telegram_cfg, PlatformConfig) else {"enabled": True}
+                    )
+                    config.platforms[Platform.TELEGRAM] = telegram_cfg
+                telegram_cfg.enabled = True
+                telegram_cfg.bots = [
+                    TelegramBotConfig.from_dict(item)
+                    for item in parsed
+                    if isinstance(item, dict)
+                ]
+
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
-        if Platform.TELEGRAM not in config.platforms:
-            config.platforms[Platform.TELEGRAM] = PlatformConfig()
-        config.platforms[Platform.TELEGRAM].enabled = True
-        config.platforms[Platform.TELEGRAM].token = telegram_token
+        telegram_cfg = config.platforms.get(Platform.TELEGRAM)
+        if isinstance(telegram_cfg, TelegramPlatformConfig):
+            default_bot = next((bot for bot in telegram_cfg.bots if bot.id == "default"), None)
+            if default_bot is None:
+                default_bot = TelegramBotConfig(id="default")
+                telegram_cfg.bots.append(default_bot)
+            telegram_cfg.enabled = True
+            default_bot.enabled = True
+            default_bot.token = telegram_token
+            telegram_cfg.token = telegram_token
+        else:
+            if Platform.TELEGRAM not in config.platforms:
+                config.platforms[Platform.TELEGRAM] = PlatformConfig()
+            config.platforms[Platform.TELEGRAM].enabled = True
+            config.platforms[Platform.TELEGRAM].token = telegram_token
     
     # Reply threading mode for Telegram (off/first/all)
     telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
     if telegram_reply_mode in ("off", "first", "all"):
-        if Platform.TELEGRAM not in config.platforms:
-            config.platforms[Platform.TELEGRAM] = PlatformConfig()
-        config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
+        telegram_cfg = config.platforms.get(Platform.TELEGRAM)
+        if isinstance(telegram_cfg, TelegramPlatformConfig):
+            telegram_cfg.reply_to_mode = telegram_reply_mode
+            default_bot = next((bot for bot in telegram_cfg.bots if bot.id == "default"), None)
+            if default_bot is None:
+                default_bot = TelegramBotConfig(id="default")
+                telegram_cfg.bots.append(default_bot)
+            default_bot.reply_to_mode = telegram_reply_mode
+        else:
+            if Platform.TELEGRAM not in config.platforms:
+                config.platforms[Platform.TELEGRAM] = PlatformConfig()
+            config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
     
     telegram_fallback_ips = os.getenv("TELEGRAM_FALLBACK_IPS", "")
     if telegram_fallback_ips:
@@ -1160,12 +1336,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     telegram_home = os.getenv("TELEGRAM_HOME_CHANNEL")
     if telegram_home and Platform.TELEGRAM in config.platforms:
-        config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        home = HomeChannel(
             platform=Platform.TELEGRAM,
             chat_id=telegram_home,
             name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
             thread_id=os.getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
         )
+        config.platforms[Platform.TELEGRAM].home_channel = home
+        telegram_cfg = config.platforms[Platform.TELEGRAM]
+        if isinstance(telegram_cfg, TelegramPlatformConfig):
+            default_bot = next((bot for bot in telegram_cfg.bots if bot.id == "default"), None)
+            if default_bot is None:
+                default_bot = TelegramBotConfig(id="default")
+                telegram_cfg.bots.append(default_bot)
+            default_bot.home_channel = home
     
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")

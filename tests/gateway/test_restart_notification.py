@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import HomeChannel, Platform
+from gateway.config import HomeChannel, Platform, TelegramBotConfig, TelegramPlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
@@ -494,6 +494,76 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     )
     # Still cleans up.
     assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_prefers_bot_specific_home_channel(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter._bot_instance_id = "alpha"
+    runner.config.platforms[Platform.TELEGRAM] = TelegramPlatformConfig(
+        enabled=True,
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="platform-home",
+            name="Platform Home",
+        ),
+        bots=[
+            TelegramBotConfig(
+                id="alpha",
+                token="tok-a",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="alpha-home",
+                    name="Alpha Home",
+                    thread_id="topic-9",
+                ),
+            )
+        ],
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "alpha-home", "topic-9")}
+    adapter.send.assert_called_once_with(
+        "alpha-home",
+        "♻️ Gateway online — Hermes is back and ready.",
+        metadata={"thread_id": "topic-9"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_uses_platform_home_when_bot_has_no_override(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter._bot_instance_id = "alpha"
+    runner.config.platforms[Platform.TELEGRAM] = TelegramPlatformConfig(
+        enabled=True,
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="platform-home",
+            name="Platform Home",
+        ),
+        bots=[TelegramBotConfig(id="alpha", token="tok-a")],
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "platform-home", None)}
+    adapter.send.assert_called_once_with(
+        "platform-home",
+        "♻️ Gateway online — Hermes is back and ready.",
+    )
 
 
 @pytest.mark.asyncio

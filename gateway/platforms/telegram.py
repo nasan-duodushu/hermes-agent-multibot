@@ -269,8 +269,9 @@ class TelegramAdapter(BasePlatformAdapter):
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, bot_instance_id: str = "default"):
         super().__init__(config, Platform.TELEGRAM)
+        self._bot_instance_id = str(bot_instance_id or "default")
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
