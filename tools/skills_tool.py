@@ -546,6 +546,47 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
+
+def _current_bot_instance_id() -> str:
+    """Read the active bot_instance_id from session context.
+
+    Returns empty string when not in a bot session (CLI, single-instance,
+    background tasks).  Empty string is treated as "no isolation" by
+    :func:`_skill_visible_to_current_bot` (backward-compatible default).
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return ""
+    try:
+        return get_session_env("HERMES_SESSION_BOT_INSTANCE_ID", "") or ""
+    except Exception:
+        return ""
+
+
+def _skill_visible_to_current_bot(skill_md, scan_dir, bot_id: str) -> bool:
+    """Return True iff this skill is visible to the given bot under per-bot isolation.
+
+    Convention (matches Phase A1 ``_bot/<id>/memory_store.db`` layout):
+
+    * ``<scan_dir>/_bot/<bot_id>/...``  → visible only to that bot
+    * ``<scan_dir>/_bot/<other>/...``   → hidden from this bot
+    * Any other path (top-level, ``_shared/`` etc.) → visible to all bots
+
+    When ``bot_id`` is empty, isolation is disabled and every skill is
+    visible (used for CLI / single-instance deployments).
+    """
+    if not bot_id:
+        return True
+    try:
+        rel_parts = skill_md.relative_to(scan_dir).parts
+    except (ValueError, AttributeError):
+        return True
+    if len(rel_parts) >= 2 and rel_parts[0] == "_bot":
+        return rel_parts[1] == bot_id
+    return True
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -571,9 +612,19 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(SKILLS_DIR)
     dirs_to_scan.extend(get_external_skills_dirs())
 
+    # Per-bot isolation: read once, apply per-skill below.
+    _bot_id = _current_bot_instance_id()
+
     for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+        # Sort so paths like ``_bot/<bot_id>/...`` are scanned before
+        # ``_shared/...`` and other top-level dirs (alphabetical order
+        # places ``_bot`` < ``_shared`` < <other>).  Combined with the
+        # ``seen_names`` de-duplication below, this makes per-bot
+        # skills override shared ones with the same name.
+        for skill_md in sorted(iter_skill_index_files(scan_dir, "SKILL.md")):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            if not _skill_visible_to_current_bot(skill_md, scan_dir, _bot_id):
                 continue
 
             skill_dir = skill_md.parent

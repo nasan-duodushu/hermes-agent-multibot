@@ -2934,6 +2934,39 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
+
+    def _message_targets_other_entity(self, message) -> bool:
+        """Return True if the message @mentions someone other than this bot.
+
+        Used by require_mention=false bots to avoid responding when
+        the user is clearly addressing a different bot or person.
+        Checks both @username mentions and text_mention entities.
+        """
+        if not self._bot:
+            return False
+        bot_username = (getattr(self._bot, "username", None) or "").lstrip("@").lower()
+        bot_id = getattr(self._bot, "id", None)
+
+        for source_text, entities in [
+            (getattr(message, "text", None) or "", getattr(message, "entities", None) or []),
+            (getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []),
+        ]:
+            for entity in entities:
+                entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+                if entity_type == "mention":
+                    offset = int(getattr(entity, "offset", -1))
+                    length = int(getattr(entity, "length", 0))
+                    if offset < 0 or length <= 0:
+                        continue
+                    mentioned = source_text[offset:offset + length].strip().lstrip("@").lower()
+                    if mentioned and bot_username and mentioned != bot_username:
+                        return True
+                elif entity_type == "text_mention":
+                    user = getattr(entity, "user", None)
+                    if user and getattr(user, "id", None) != bot_id:
+                        return True
+        return False
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -2974,7 +3007,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():
-            return True
+            if not self._message_targets_other_entity(message):
+                return True
         if self._is_reply_to_bot(message):
             return True
         if self._message_mentions_bot(message):
