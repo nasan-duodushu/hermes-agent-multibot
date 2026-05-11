@@ -158,7 +158,17 @@ class HolographicMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
         _hermes_home = str(get_hermes_home())
-        _default_db = _hermes_home + "/memory_store.db"
+        # Phase A1 — per-bot memory namespace isolation.
+        # When the caller (AIAgent) passes bot_instance_id, route to a
+        # bot-scoped subdirectory so multiple bots hosted in the same
+        # HERMES_HOME (1-instance-N-bot mode) keep their facts separate.
+        # Empty bot_instance_id preserves the legacy single-bot path so
+        # existing 4-home production deployments are unchanged.
+        _bot_id = str(kwargs.get("bot_instance_id") or "").strip()
+        if _bot_id:
+            _default_db = f"{_hermes_home}/memory/{_bot_id}/memory_store.db"
+        else:
+            _default_db = _hermes_home + "/memory_store.db"
         db_path = self._config.get("db_path", _default_db)
         # Expand $HERMES_HOME in user-supplied paths so config values like
         # "$HERMES_HOME/memory_store.db" or "~/.hermes/memory_store.db" both

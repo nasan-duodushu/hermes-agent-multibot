@@ -970,6 +970,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        bot_instance_id: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -1036,6 +1037,8 @@ class AIAgent:
         self._chat_type = chat_type
         self._thread_id = thread_id
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        # Per-bot identity (Phase A1 — used for memory namespace routing)
+        self._bot_instance_id = str(bot_instance_id or "").strip()
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1800,6 +1803,11 @@ class AIAgent:
                         # Thread gateway session key for stable per-chat Honcho session isolation
                         if self._gateway_session_key:
                             _init_kwargs["gateway_session_key"] = self._gateway_session_key
+                        # Phase A1: per-bot memory namespace. Providers that
+                        # respect bot_instance_id (e.g. holographic) will route
+                        # their on-disk store under $HERMES_HOME/memory/<bot_id>/.
+                        if self._bot_instance_id:
+                            _init_kwargs["bot_instance_id"] = self._bot_instance_id
                         # Profile identity for per-profile provider scoping
                         try:
                             from hermes_cli.profiles import get_active_profile_name

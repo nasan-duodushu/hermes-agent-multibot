@@ -9798,6 +9798,7 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    bot_instance_id=getattr(source, "bot_instance_id", None),
                 )
                 try:
                     return agent.run_conversation(
@@ -14319,6 +14320,7 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    bot_instance_id=getattr(source, "bot_instance_id", None),
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
