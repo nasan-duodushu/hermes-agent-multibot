@@ -135,10 +135,13 @@ class DeliveryRouter:
         """
         self.config = config
         self.adapters = adapters or {}
+        self.platform_adapters: Dict[Platform, List[Any]] = {}
         self.output_dir = get_hermes_home() / "cron" / "output"
 
     def _select_adapter(self, target: DeliveryTarget):
-        adapter = self.adapters.get(target.platform)
+        adapter = self.platform_adapters.get(target.platform)
+        if not adapter:
+            adapter = self.adapters.get(target.platform)
         if isinstance(adapter, list):
             if target.bot_instance_id:
                 for candidate in adapter:

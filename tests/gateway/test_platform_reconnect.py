@@ -59,6 +59,8 @@ def _make_runner():
     runner._exit_cleanly = False
     runner._failed_platforms = {}
     runner.adapters = {}
+    runner._platform_adapters = {}
+    runner._adapter_keys = {}
     runner.delivery_router = MagicMock()
     runner._running_agents = {}
     runner._pending_messages = {}
@@ -101,7 +103,7 @@ class TestStartupPlatformIsolation:
             Platform.FEISHU: StubAdapter(platform=Platform.FEISHU),
         }
         runner._create_adapter = MagicMock(
-            side_effect=lambda platform, _config: adapters[platform]
+            side_effect=lambda platform, _config, instance_id=None: adapters[platform]
         )
         runner._connect_adapter_with_timeout = AsyncMock(
             side_effect=[
@@ -129,7 +131,7 @@ class TestStartupPlatformIsolation:
                                 with patch("gateway.run.asyncio.create_task", side_effect=fake_create_task):
                                     assert await runner.start() is True
 
-        assert Platform.TELEGRAM in runner._failed_platforms
+        assert "telegram" in runner._failed_platforms
         assert Platform.FEISHU in runner.adapters
         assert Platform.TELEGRAM not in runner.adapters
         assert runner._create_adapter.call_count == 2
@@ -216,6 +218,57 @@ class TestPlatformReconnectWatcher:
 
         assert Platform.TELEGRAM not in runner._failed_platforms
         assert Platform.TELEGRAM in runner.adapters
+
+    @pytest.mark.asyncio
+    async def test_reconnect_telegram_bot_instance_preserves_instance_routing(self):
+        """Reconnect watcher must recreate/register the correct Telegram sibling adapter."""
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._register_adapter = GatewayRunner._register_adapter.__get__(runner, GatewayRunner)
+        runner._adapter_instance_key = GatewayRunner._adapter_instance_key.__get__(runner, GatewayRunner)
+
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms["telegram/alpha"] = {
+            "config": platform_config,
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+            "platform": Platform.TELEGRAM,
+            "bot_instance_id": "alpha",
+        }
+
+        primary = StubAdapter(succeed=True)
+        primary._bot_instance_id = "default"
+        runner.adapters = {Platform.TELEGRAM: primary}
+        runner._platform_adapters = {Platform.TELEGRAM: [primary]}
+        runner._adapter_keys = {primary: "telegram/default"}
+
+        alpha_adapter = StubAdapter(succeed=True)
+        alpha_adapter._bot_instance_id = "alpha"
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=alpha_adapter) as mock_create:
+            with patch("gateway.run.build_channel_directory", create=True):
+                async def run_one_iteration():
+                    runner._running = True
+                    call_count = 0
+
+                    async def fake_sleep(n):
+                        nonlocal call_count
+                        call_count += 1
+                        if call_count > 1:
+                            runner._running = False
+                        await real_sleep(0)
+
+                    with patch("asyncio.sleep", side_effect=fake_sleep):
+                        await runner._platform_reconnect_watcher()
+
+                await run_one_iteration()
+
+        mock_create.assert_called_once_with(Platform.TELEGRAM, platform_config, instance_id="alpha")
+        assert "telegram/alpha" not in runner._failed_platforms
+        assert runner.adapters[Platform.TELEGRAM] is primary
+        assert alpha_adapter in runner._platform_adapters[Platform.TELEGRAM]
+        assert runner.delivery_router.platform_adapters is runner._platform_adapters
 
     @pytest.mark.asyncio
     async def test_reconnect_nonretryable_removed_from_queue(self):
@@ -439,8 +492,8 @@ class TestRuntimeDisconnectQueuing:
 
         await runner._handle_adapter_fatal_error(adapter)
 
-        assert Platform.TELEGRAM in runner._failed_platforms
-        assert runner._failed_platforms[Platform.TELEGRAM]["attempts"] == 0
+        assert "telegram" in runner._failed_platforms
+        assert runner._failed_platforms["telegram"]["attempts"] == 0
 
     @pytest.mark.asyncio
     async def test_nonretryable_runtime_error_not_queued(self):
@@ -477,7 +530,7 @@ class TestRuntimeDisconnectQueuing:
         # stop() SHOULD be called — gateway exits for systemd restart
         runner.stop.assert_called_once()
         assert runner._exit_with_failure is True
-        assert Platform.TELEGRAM in runner._failed_platforms
+        assert "telegram" in runner._failed_platforms
 
     @pytest.mark.asyncio
     async def test_retryable_error_no_exit_when_other_adapters_still_connected(self):
@@ -497,7 +550,7 @@ class TestRuntimeDisconnectQueuing:
 
         # stop() should NOT have been called — Discord is still up
         runner.stop.assert_not_called()
-        assert Platform.TELEGRAM in runner._failed_platforms
+        assert "telegram" in runner._failed_platforms
 
     @pytest.mark.asyncio
     async def test_nonretryable_error_triggers_shutdown(self):

@@ -100,6 +100,12 @@ def make_restart_runner(
     runner._send_home_channel_startup_notifications = (
         GatewayRunner._send_home_channel_startup_notifications.__get__(runner, GatewayRunner)
     )
+    runner._schedule_resume_pending_sessions = GatewayRunner._schedule_resume_pending_sessions.__get__(
+        runner, GatewayRunner
+    )
+    runner._is_stale_restart_redelivery = GatewayRunner._is_stale_restart_redelivery.__get__(
+        runner, GatewayRunner
+    )
     runner._status_action_label = GatewayRunner._status_action_label.__get__(
         runner, GatewayRunner
     )
@@ -135,9 +141,14 @@ def make_restart_runner(
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
     runner.delivery_router = MagicMock()
+    runner._adapter_for_source = GatewayRunner._adapter_for_source.__get__(runner, GatewayRunner)
+    runner._platform_adapters = {}
+    runner._adapter_keys = {}
 
     platform_adapter = adapter or RestartTestAdapter()
     platform_adapter.set_message_handler(AsyncMock(return_value=None))
     platform_adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
     runner.adapters = {Platform.TELEGRAM: platform_adapter}
+    runner._platform_adapters = {Platform.TELEGRAM: [platform_adapter]}
+    runner._adapter_keys = {platform_adapter: Platform.TELEGRAM.value}
     return runner, platform_adapter

@@ -38,13 +38,14 @@ from gateway.platforms.base import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_event(text="hello", chat_id="123", platform_val="telegram"):
+def _make_event(text="hello", chat_id="123", platform_val="telegram", bot_instance_id=None):
     """Build a minimal MessageEvent."""
     source = SessionSource(
         platform=MagicMock(value=platform_val),
         chat_id=chat_id,
         chat_type="private",
         user_id="user1",
+        bot_instance_id=bot_instance_id,
     )
     evt = MessageEvent(
         text=text,
@@ -66,6 +67,8 @@ def _make_runner():
     runner._busy_ack_ts = {}
     runner._draining = False
     runner.adapters = {}
+    runner._platform_adapters = {}
+    runner._adapter_keys = {}
     runner.config = MagicMock()
     runner.session_store = None
     runner.hooks = MagicMock()
@@ -73,6 +76,7 @@ def _make_runner():
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = True
     runner._is_user_authorized = lambda _source: True
+    runner._adapter_for_source = GatewayRunner._adapter_for_source.__get__(runner, GatewayRunner)
     return runner, _AGENT_PENDING_SENTINEL
 
 
@@ -401,6 +405,51 @@ class TestBusySessionAck:
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
         assert "restarting" in content
+
+    @pytest.mark.asyncio
+    async def test_busy_path_uses_bot_specific_adapter_for_ack(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        default_adapter = _make_adapter()
+        alpha_adapter = _make_adapter()
+        alpha_adapter._bot_instance_id = "alpha"
+
+        event = _make_event(text="bot-aware busy ack", bot_instance_id="alpha")
+        sk = build_session_key(event.source)
+
+        runner.adapters[event.source.platform] = default_adapter
+        runner._platform_adapters[event.source.platform] = [default_adapter, alpha_adapter]
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        alpha_adapter._send_with_retry.assert_called_once()
+        default_adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_drain_busy_path_uses_bot_specific_adapter_for_ack(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        runner._restart_requested = True
+        runner._draining = True
+        default_adapter = _make_adapter()
+        alpha_adapter = _make_adapter()
+        alpha_adapter._bot_instance_id = "alpha"
+
+        event = _make_event(text="drain-aware busy ack", bot_instance_id="alpha")
+        sk = build_session_key(event.source)
+
+        runner.adapters[event.source.platform] = default_adapter
+        runner._platform_adapters[event.source.platform] = [default_adapter, alpha_adapter]
+        runner._queue_during_drain_enabled = lambda: False
+        runner._status_action_gerund = lambda: "restarting"
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        alpha_adapter._send_with_retry.assert_called_once()
+        default_adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_pending_sentinel_no_interrupt(self):

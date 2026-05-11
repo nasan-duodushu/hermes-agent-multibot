@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import HomeChannel, Platform, TelegramBotConfig, TelegramPlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.restart import build_restart_target_payload, load_restart_target_payload, normalize_bot_instance_id
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
@@ -31,6 +33,34 @@ def test_restart_notification_pending_true_with_marker(tmp_path, monkeypatch):
     (tmp_path / ".restart_notify.json").write_text("{}")
 
     assert gateway_run._restart_notification_pending() is True
+
+
+def test_restart_metadata_helpers_normalize_bot_instance_id(tmp_path):
+    payload = build_restart_target_payload(
+        platform=Platform.TELEGRAM,
+        chat_id="42",
+        thread_id="topic-1",
+        bot_instance_id=" alpha ",
+        requested_at=123.4,
+        update_id=99,
+    )
+    assert payload == {
+        "platform": "telegram",
+        "chat_id": "42",
+        "thread_id": "topic-1",
+        "bot_instance_id": "alpha",
+        "requested_at": 123.4,
+        "update_id": 99,
+    }
+
+    path = tmp_path / "restart.json"
+    path.write_text(json.dumps({"platform": "telegram", "chat_id": "42", "bot_instance_id": " alpha "}))
+    assert load_restart_target_payload(path) == {
+        "platform": "telegram",
+        "chat_id": "42",
+        "bot_instance_id": "alpha",
+    }
+    assert normalize_bot_instance_id("  ") is None
 
 
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
@@ -146,12 +176,14 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     runner.request_restart = MagicMock(return_value=True)
 
     source = make_restart_source(chat_id="42")
+    source.thread_id = "topic-7"
     source.bot_instance_id = "alpha"
     event = MessageEvent(
         text="/restart",
         message_type=MessageType.TEXT,
         source=source,
         message_id="m1",
+        platform_update_id=123,
     )
 
     await runner._handle_restart_command(event)
@@ -161,6 +193,10 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     assert calls[0][1]["chat_id"] == "42"
     assert calls[0][1]["bot_instance_id"] == "alpha"
     assert calls[1][1]["platform"] == "telegram"
+    assert calls[1][1]["chat_id"] == "42"
+    assert calls[1][1]["thread_id"] == "topic-7"
+    assert calls[1][1]["bot_instance_id"] == "alpha"
+    assert calls[1][1]["update_id"] == 123
 
 
 @pytest.mark.asyncio
@@ -557,6 +593,86 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     )
     # Still cleans up.
     assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_prefers_matching_bot_instance_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+        "bot_instance_id": "alpha",
+    }))
+
+    runner, adapter = make_restart_runner()
+    other_adapter = AsyncMock()
+    other_adapter._bot_instance_id = "beta"
+    other_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="other"))
+    adapter._bot_instance_id = "alpha"
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="main"))
+    runner.adapters = {Platform.TELEGRAM: [other_adapter, adapter]}
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    adapter.send.assert_called_once_with(
+        "42",
+        "♻ Gateway restarted successfully. Your session continues.",
+        metadata=None,
+    )
+    other_adapter.send.assert_not_called()
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_is_stale_restart_redelivery_requires_matching_bot_instance_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_last_processed.json").write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+        "bot_instance_id": "alpha",
+        "requested_at": time.time(),
+        "update_id": 123,
+    }))
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="42")
+    source.bot_instance_id = "beta"
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m-restart",
+        platform_update_id=123,
+    )
+
+    assert runner._is_stale_restart_redelivery(event) is False
+
+
+@pytest.mark.asyncio
+async def test_is_stale_restart_redelivery_requires_matching_thread_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_last_processed.json").write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+        "thread_id": "topic-7",
+        "requested_at": time.time(),
+        "update_id": 123,
+    }))
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="42", thread_id="topic-8")
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m-restart-thread",
+        platform_update_id=123,
+    )
+
+    assert runner._is_stale_restart_redelivery(event) is False
 
 
 @pytest.mark.asyncio

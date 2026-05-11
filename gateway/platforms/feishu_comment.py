@@ -27,6 +27,9 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from gateway.config import Platform
+from gateway.session import SessionSource
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -972,12 +975,12 @@ def build_whole_comment_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_model_and_runtime() -> Tuple[str, dict]:
+def _resolve_model_and_runtime(source: Optional[SessionSource] = None) -> Tuple[str, dict]:
     """Resolve model and provider credentials, same as gateway message handling."""
     from gateway.run import _load_gateway_config, _resolve_gateway_model
 
     user_config = _load_gateway_config()
-    model = _resolve_gateway_model(user_config)
+    model = _resolve_gateway_model(user_config, source=source)
 
     from gateway.run import _resolve_runtime_agent_kwargs
     runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -1061,7 +1064,23 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     set_drive_client(client)
 
     try:
-        model, runtime_kwargs = _resolve_model_and_runtime()
+        comment_source: Optional[SessionSource] = None
+        if session_key:
+            from gateway.run import _parse_session_key
+
+            parsed_session = _parse_session_key(session_key)
+            bot_instance_id = None
+            if isinstance(parsed_session, dict):
+                bot_instance_id = parsed_session.get("bot_instance_id")
+            if bot_instance_id:
+                comment_source = SessionSource(
+                    platform=Platform.FEISHU,
+                    chat_id=session_key,
+                    chat_type="thread",
+                    bot_instance_id=str(bot_instance_id),
+                )
+
+        model, runtime_kwargs = _resolve_model_and_runtime(comment_source)
         logger.info("[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s",
                     model, runtime_kwargs.get("provider"), (runtime_kwargs.get("base_url") or "")[:50])
 

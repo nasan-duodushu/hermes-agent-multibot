@@ -172,6 +172,7 @@ class TestBotAwareHomeChannelRouting:
             config,
             adapters={Platform.TELEGRAM: [alpha_adapter, beta_adapter]},
         )
+        router.platform_adapters = {Platform.TELEGRAM: [alpha_adapter, beta_adapter]}
         alpha_adapter._bot_instance_id = "alpha"
         beta_adapter._bot_instance_id = "beta"
 
@@ -208,6 +209,7 @@ class TestBotAwareHomeChannelRouting:
             config,
             adapters={Platform.TELEGRAM: [alpha_adapter]},
         )
+        router.platform_adapters = {Platform.TELEGRAM: [alpha_adapter]}
         alpha_adapter._bot_instance_id = "alpha"
 
         await router._deliver_to_platform(
@@ -255,6 +257,7 @@ class TestBotAwareHomeChannelRouting:
             config,
             adapters={Platform.TELEGRAM: [beta_adapter]},
         )
+        router.platform_adapters = {Platform.TELEGRAM: [beta_adapter]}
         beta_adapter._bot_instance_id = "beta"
 
         results = await router.deliver(
@@ -281,3 +284,49 @@ class TestBotAwareHomeChannelRouting:
             "reason": "duplicate_resolved_target",
             "resolved_target": "telegram:beta-home:beta-thread",
         }
+
+    @pytest.mark.asyncio
+    async def test_router_prefers_platform_adapters_for_bot_specific_delivery(self):
+        default_adapter = AsyncMock()
+        default_adapter.send = AsyncMock(return_value={"ok": True})
+        alpha_adapter = AsyncMock()
+        alpha_adapter.send = AsyncMock(return_value={"ok": True})
+        alpha_adapter._bot_instance_id = "alpha"
+
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: TelegramPlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform.TELEGRAM,
+                        chat_id="platform-home",
+                        name="Platform Home",
+                    ),
+                    bots=[
+                        TelegramBotConfig(
+                            id="alpha",
+                            token="tok-a",
+                            home_channel=HomeChannel(
+                                platform=Platform.TELEGRAM,
+                                chat_id="alpha-home",
+                                name="Alpha Home",
+                            ),
+                        )
+                    ],
+                )
+            }
+        )
+        router = DeliveryRouter(
+            config,
+            adapters={Platform.TELEGRAM: default_adapter},
+        )
+        router.platform_adapters = {Platform.TELEGRAM: [default_adapter, alpha_adapter]}
+
+        await router._deliver_to_platform(
+            DeliveryTarget(platform=Platform.TELEGRAM, bot_instance_id="alpha"),
+            "hello",
+            metadata=None,
+        )
+
+        alpha_adapter.send.assert_awaited_once_with("alpha-home", "hello", metadata=None)
+        default_adapter.send.assert_not_awaited()

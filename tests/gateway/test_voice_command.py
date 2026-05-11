@@ -58,7 +58,7 @@ from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") -> MessageEvent:
+def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123", bot_instance_id=None) -> MessageEvent:
     source = SessionSource(
         chat_id=chat_id,
         user_id="user1",
@@ -66,6 +66,7 @@ def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") ->
     )
     source.platform.value = "telegram"
     source.thread_id = None
+    source.bot_instance_id = bot_instance_id
     event = MessageEvent(text=text, message_type=message_type, source=source)
     event.message_id = "msg42"
     return event
@@ -76,11 +77,14 @@ def _make_runner(tmp_path):
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
+    runner._platform_adapters = {}
+    runner._adapter_keys = {}
     runner._voice_mode = {}
     runner._VOICE_MODE_PATH = tmp_path / "gateway_voice_mode.json"
     runner._session_db = None
     runner.session_store = MagicMock()
     runner._is_user_authorized = lambda source: True
+    runner._adapter_for_source = GatewayRunner._adapter_for_source.__get__(runner, GatewayRunner)
     return runner
 
 
@@ -128,6 +132,24 @@ class TestHandleVoiceCommand:
         event = _make_event("/voice status")
         result = await runner._handle_voice_command(event)
         assert "voice reply" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_voice_command_uses_bot_specific_key_and_adapter(self, runner):
+        from gateway.config import PlatformConfig, Platform
+
+        default_adapter = SimpleNamespace(platform=Platform.TELEGRAM, _auto_tts_disabled_chats=set(), _auto_tts_enabled_chats=set())
+        alpha_adapter = SimpleNamespace(platform=Platform.TELEGRAM, _bot_instance_id="alpha", _auto_tts_disabled_chats=set(), _auto_tts_enabled_chats=set())
+        runner.adapters = {Platform.TELEGRAM: default_adapter}
+        runner._platform_adapters = {Platform.TELEGRAM: [default_adapter, alpha_adapter]}
+        event = _make_event("/voice on", bot_instance_id="alpha")
+        event.source.platform = Platform.TELEGRAM
+
+        result = await runner._handle_voice_command(event)
+
+        assert "enabled" in result.lower()
+        assert runner._voice_mode["telegram/alpha:123"] == "voice_only"
+        assert "123" in alpha_adapter._auto_tts_enabled_chats
+        assert "123" not in default_adapter._auto_tts_enabled_chats
 
     @pytest.mark.asyncio
     async def test_toggle_off_to_on(self, runner):

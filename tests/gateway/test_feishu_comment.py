@@ -10,6 +10,7 @@ from gateway.platforms.feishu_comment import (
     parse_drive_comment_event,
     _ALLOWED_NOTICE_TYPES,
     _sanitize_comment_text,
+    _run_comment_agent,
 )
 
 
@@ -255,6 +256,44 @@ class TestWikiReverseLookup(unittest.TestCase):
         # Second call should include wiki_token
         second_call_kwargs = mock_resolve.call_args_list[1]
         self.assertEqual(second_call_kwargs[1].get("wiki_token") or second_call_kwargs[0][3], "WIKI123")
+
+class TestCommentModelResolution(unittest.TestCase):
+    @patch("gateway.platforms.feishu_comment._save_session_history")
+    @patch("gateway.platforms.feishu_comment._load_session_history", return_value=[])
+    @patch("run_agent.AIAgent")
+    @patch("gateway.platforms.feishu_comment._resolve_model_and_runtime")
+    def test_run_comment_agent_passes_bot_instance_source(
+        self, mock_resolve, mock_agent_cls, mock_load_history, mock_save_history
+    ):
+        mock_resolve.return_value = (
+            "test-model",
+            {
+                "provider": "openai",
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+                "credential_pool": None,
+            },
+        )
+        mock_agent = Mock()
+        mock_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 0,
+        }
+        mock_agent_cls.return_value = mock_agent
+
+        result = _run_comment_agent(
+            "hello",
+            Mock(),
+            session_key="agent:alpha:feishu:thread:comment-doc:docx:token",
+        )
+
+        self.assertEqual(result, "ok")
+        mock_resolve.assert_called_once()
+        source = mock_resolve.call_args.args[0]
+        self.assertIsNotNone(source)
+        self.assertEqual(source.bot_instance_id, "alpha")
 
 
 if __name__ == "__main__":

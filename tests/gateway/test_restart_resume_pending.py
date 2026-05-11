@@ -1007,6 +1007,39 @@ async def test_startup_auto_resume_includes_crash_recovery():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_prefers_bot_specific_adapter():
+    """Auto-resume must route by source.bot_instance_id when sibling adapters exist."""
+    runner, default_adapter = make_restart_runner()
+    alpha_adapter = type(default_adapter)()
+    alpha_adapter._bot_instance_id = "alpha"
+    alpha_adapter.handle_message = AsyncMock()
+    default_adapter.handle_message = AsyncMock()
+    source = make_restart_source(chat_id="resume-alpha")
+    source.bot_instance_id = "alpha"
+    pending_entry = SessionEntry(
+        session_key="agent:alpha:telegram:dm:resume-alpha",
+        session_id="sid-alpha",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._platform_adapters = {Platform.TELEGRAM: [default_adapter, alpha_adapter]}
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    alpha_adapter.handle_message.assert_awaited_once()
+    default_adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_skips_stale_entries():
     """Entries older than the freshness window must not be auto-resumed."""
     runner, adapter = make_restart_runner()

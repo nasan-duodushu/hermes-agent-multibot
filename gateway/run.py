@@ -564,6 +564,9 @@ from gateway.platforms.base import (
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    build_restart_target_payload,
+    load_restart_target_payload,
+    normalize_bot_instance_id,
     parse_restart_drain_timeout,
 )
 
@@ -1131,6 +1134,7 @@ class GatewayRunner:
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
         self.delivery_router = DeliveryRouter(self.config)
+        self.delivery_router.platform_adapters = self._platform_adapters
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -1351,8 +1355,15 @@ class GatewayRunner:
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
-    def _voice_key(self, platform: Platform, chat_id: str) -> str:
-        """Return a platform-namespaced key for voice mode state."""
+    def _voice_key(
+        self,
+        platform: Platform,
+        chat_id: str,
+        bot_instance_id: Optional[str] = None,
+    ) -> str:
+        """Return a bot-aware platform key for voice mode state."""
+        if bot_instance_id:
+            return f"{platform.value}/{str(bot_instance_id).strip()}:{chat_id}"
         return f"{platform.value}:{chat_id}"
 
     def _load_voice_modes(self) -> Dict[str, str]:
@@ -1815,16 +1826,8 @@ class GatewayRunner:
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
             platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
-                    "attempts": 0,
-                    "next_retry": time.monotonic() + 30,
-                }
-                logger.info(
-                    "%s queued for background reconnection",
-                    adapter.platform.value,
-                )
+            if platform_config:
+                self._queue_failed_adapter(adapter, platform_config)
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
@@ -1857,8 +1860,127 @@ class GatewayRunner:
         self._exit_reason = reason
         self._shutdown_event.set()
 
-    def _running_agent_count(self) -> int:
-        return len(self._running_agents)
+    @staticmethod
+    def _source_bot_instance_id(source: Optional[SessionSource]) -> Optional[str]:
+        return normalize_bot_instance_id(
+            getattr(source, "bot_instance_id", None) if source is not None else None
+        )
+
+    @staticmethod
+    def _failed_platform_key(platform: Platform, bot_instance_id: Optional[str] = None) -> str:
+        if bot_instance_id:
+            return f"{platform.value}/{str(bot_instance_id).strip()}"
+        return platform.value
+
+    @classmethod
+    def _failed_platform_parts(cls, key: Any) -> tuple[Optional[Platform], Optional[str]]:
+        if isinstance(key, Platform):
+            return key, None
+        raw = str(key or "").strip()
+        if not raw:
+            return None, None
+        platform_raw, sep, bot_instance_id = raw.partition("/")
+        try:
+            platform = Platform(platform_raw)
+        except Exception:
+            return None, None
+        if not sep:
+            return platform, None
+        bot_instance_id = str(bot_instance_id or "").strip() or None
+        return platform, bot_instance_id
+
+    @classmethod
+    def _failed_platform_matches(
+        cls,
+        key: Any,
+        *,
+        platform: Optional[Platform] = None,
+        bot_instance_id: Optional[str] = None,
+    ) -> bool:
+        key_platform, key_bot_instance_id = cls._failed_platform_parts(key)
+        if platform is not None and key_platform != platform:
+            return False
+        wanted_bot = str(bot_instance_id or "").strip() or None
+        return key_bot_instance_id == wanted_bot
+
+    def _queue_failed_adapter(self, adapter: BasePlatformAdapter, platform_config: Any) -> None:
+        failed_platforms = getattr(self, "_failed_platforms", None)
+        if failed_platforms is None:
+            failed_platforms = {}
+            self._failed_platforms = failed_platforms
+        bot_instance_id = str(getattr(adapter, "_bot_instance_id", None) or "").strip() or None
+        failed_key = self._failed_platform_key(adapter.platform, bot_instance_id)
+        if failed_key in failed_platforms:
+            return
+        failed_platforms[failed_key] = {
+            "config": platform_config,
+            "attempts": 0,
+            "next_retry": time.monotonic() + 30,
+            "platform": adapter.platform,
+            "bot_instance_id": bot_instance_id,
+        }
+        logger.info("%s queued for background reconnection", failed_key)
+
+    def _iter_failed_platform_entries(
+        self,
+        *,
+        platform: Optional[Platform] = None,
+        bot_instance_id: Optional[str] = None,
+    ) -> list[tuple[Any, Dict[str, Any]]]:
+        failed_platforms = getattr(self, "_failed_platforms", {}) or {}
+        entries: list[tuple[Any, Dict[str, Any]]] = []
+        for key, info in list(failed_platforms.items()):
+            if self._failed_platform_matches(key, platform=platform, bot_instance_id=bot_instance_id):
+                entries.append((key, info))
+        return entries
+
+    @staticmethod
+    def _session_key_bot_instance_id(session_key: str) -> Optional[str]:
+        parsed = _parse_session_key(session_key)
+        if not parsed:
+            return None
+        bot_instance_id = str(parsed.get("bot_instance_id") or "").strip()
+        return bot_instance_id or None
+
+    def _session_matches_bot_instance(self, session_key: str, bot_instance_id: Optional[str]) -> bool:
+        wanted = str(bot_instance_id or "").strip()
+        if not wanted:
+            return True
+        return self._session_key_bot_instance_id(session_key) == wanted
+
+    def _iter_running_agents(
+        self,
+        *,
+        bot_instance_id: Optional[str] = None,
+    ) -> list[tuple[str, Any]]:
+        return [
+            (session_key, agent)
+            for session_key, agent in list(self._running_agents.items())
+            if self._session_matches_bot_instance(session_key, bot_instance_id)
+        ]
+
+    def _snapshot_running_agents(self, *, bot_instance_id: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            session_key: agent
+            for session_key, agent in self._iter_running_agents(bot_instance_id=bot_instance_id)
+        }
+
+    def _running_agent_count(self, *, bot_instance_id: Optional[str] = None) -> int:
+        return len(self._iter_running_agents(bot_instance_id=bot_instance_id))
+
+    def _adapter_for_source(self, source: Optional[SessionSource]):
+        if source is None or getattr(source, "platform", None) is None:
+            return None
+        try:
+            bot_instance_id = self._source_bot_instance_id(source)
+            siblings = getattr(self, "_platform_adapters", {}).get(source.platform, [])
+            if bot_instance_id and siblings:
+                for adapter in siblings:
+                    if str(getattr(adapter, "_bot_instance_id", "") or "").strip() == bot_instance_id:
+                        return adapter
+            return self.adapters.get(source.platform)
+        except Exception:
+            return self.adapters.get(getattr(source, "platform", None))
 
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
@@ -2357,15 +2479,15 @@ class GatewayRunner:
             pass
         return None
 
-    def _snapshot_running_agents(self) -> Dict[str, Any]:
+    def _snapshot_running_agents(self, *, bot_instance_id: Optional[str] = None) -> Dict[str, Any]:
         return {
             session_key: agent
-            for session_key, agent in self._running_agents.items()
+            for session_key, agent in self._iter_running_agents(bot_instance_id=bot_instance_id)
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
@@ -2389,7 +2511,7 @@ class GatewayRunner:
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._adapter_for_source(event.source)
             if not adapter:
                 return True
 
@@ -2409,7 +2531,7 @@ class GatewayRunner:
             return True
 
         # Normal busy case (agent actively running a task)
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
 
@@ -2553,21 +2675,26 @@ class GatewayRunner:
 
         return True
 
-    async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
-        snapshot = self._snapshot_running_agents()
-        last_active_count = self._running_agent_count()
+    async def _drain_active_agents(
+        self,
+        timeout: float,
+        *,
+        bot_instance_id: Optional[str] = None,
+    ) -> tuple[Dict[str, Any], bool]:
+        snapshot = self._snapshot_running_agents(bot_instance_id=bot_instance_id)
+        last_active_count = self._running_agent_count(bot_instance_id=bot_instance_id)
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_status_at
             now = asyncio.get_running_loop().time()
-            active_count = self._running_agent_count()
+            active_count = self._running_agent_count(bot_instance_id=bot_instance_id)
             if force or active_count != last_active_count or (now - last_status_at) >= 1.0:
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_status_at = now
 
-        if not self._running_agents:
+        if not self._running_agent_count(bot_instance_id=bot_instance_id):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -2576,15 +2703,15 @@ class GatewayRunner:
             return snapshot, True
 
         deadline = asyncio.get_running_loop().time() + timeout
-        while self._running_agents and asyncio.get_running_loop().time() < deadline:
+        while self._running_agent_count(bot_instance_id=bot_instance_id) and asyncio.get_running_loop().time() < deadline:
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = bool(self._running_agents)
+        timed_out = bool(self._running_agent_count(bot_instance_id=bot_instance_id))
         _maybe_update_status(force=True)
         return snapshot, timed_out
 
-    def _interrupt_running_agents(self, reason: str) -> None:
-        for session_key, agent in list(self._running_agents.items()):
+    def _interrupt_running_agents(self, reason: str, *, bot_instance_id: Optional[str] = None) -> None:
+        for session_key, agent in self._iter_running_agents(bot_instance_id=bot_instance_id):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
@@ -2593,14 +2720,14 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(self, *, bot_instance_id: Optional[str] = None) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the very start of stop() — adapters are still connected so
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
-        active = self._snapshot_running_agents()
+        active = self._snapshot_running_agents(bot_instance_id=bot_instance_id)
 
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
@@ -2611,9 +2738,10 @@ class GatewayRunner:
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
-        notified: set[tuple[str, str, Optional[str]]] = set()
+        notified: set[tuple[str, str, Optional[str], Optional[str]]] = set()
         for session_key in active:
             source = None
+            source_bot_instance_id = None
             try:
                 if getattr(self, "session_store", None) is not None:
                     self.session_store._ensure_loaded()
@@ -2633,6 +2761,7 @@ class GatewayRunner:
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                source_bot_instance_id = self._source_bot_instance_id(source)
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -2642,17 +2771,23 @@ class GatewayRunner:
                 platform_str = _parsed["platform"]
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
+                source_bot_instance_id = str(_parsed.get("bot_instance_id") or "").strip() or None
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
             # destinations via metadata.
-            dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
+            dedup_key = (
+                platform_str,
+                chat_id,
+                str(thread_id) if thread_id else None,
+                source_bot_instance_id,
+            )
             if dedup_key in notified:
                 continue
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
+                adapter = self._adapter_for_source(source) if source is not None else self.adapters.get(platform)
                 if not adapter:
                     continue
 
@@ -2694,8 +2829,27 @@ class GatewayRunner:
         # elsewhere), which would otherwise trigger
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
-        for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
+        selected_adapters = list(self.adapters.items())
+        if bot_instance_id:
+            wanted_bot_id = str(bot_instance_id).strip()
+            selected_adapters = [
+                (platform, adapter)
+                for platform, adapter in selected_adapters
+                if str(getattr(adapter, "_bot_instance_id", "") or "").strip() == wanted_bot_id
+            ]
+            if not selected_adapters:
+                selected_adapters = [
+                    (platform, adapter)
+                    for platform, siblings in list(getattr(self, "_platform_adapters", {}).items())
+                    for adapter in siblings
+                    if str(getattr(adapter, "_bot_instance_id", "") or "").strip() == wanted_bot_id
+                ]
+
+        for platform, adapter in selected_adapters:
+            adapter_bot_instance_id = str(getattr(adapter, "_bot_instance_id", "") or "").strip() or "main"
+            if bot_instance_id and adapter_bot_instance_id != str(bot_instance_id).strip():
+                continue
+            home = self.config.get_home_channel(platform, bot_instance_id=adapter_bot_instance_id)
             if not home or not home.chat_id:
                 continue
 
@@ -2707,7 +2861,12 @@ class GatewayRunner:
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            dedup_key = (
+                platform.value,
+                str(home.chat_id),
+                str(home.thread_id) if home.thread_id else None,
+                adapter_bot_instance_id,
+            )
             if dedup_key in notified:
                 continue
 
@@ -2989,11 +3148,12 @@ class GatewayRunner:
                 continue
 
             source = entry.origin
-            adapter = self.adapters.get(source.platform)
+            adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s",
+                    "Skipping auto-resume for %s: adapter not ready for %s/%s",
                     entry.session_key,
+                    getattr(source, "chat_id", None),
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
@@ -3316,17 +3476,29 @@ class GatewayRunner:
                     try:
                         retryable = is_retryable_startup_error(e)
                     except Exception:
-                        retryable = False
+                        retryable = isinstance(e, TimeoutError)
                     if retryable:
-                        self._failed_platforms[platform] = {
+                        failed_key = self._failed_platform_key(platform, instance_id)
+                        self._failed_platforms[failed_key] = {
                             "config": platform_config,
                             "attempts": 0,
                             "next_retry": time.monotonic() + 30,
+                            "platform": platform,
+                            "bot_instance_id": instance_id,
                         }
                         logger.info(
                             "%s queued for background reconnection after startup failure",
-                            platform.value,
+                            failed_key,
                         )
+                        self._update_platform_runtime_status(
+                            failed_key,
+                            platform_state="retrying",
+                            error_code=None,
+                            error_message=str(e),
+                        )
+                        startup_retryable_errors.append(f"{failed_key}: {e}")
+                    else:
+                        startup_nonretryable_errors.append(f"{platform.value}: {e}")
                     # Defensive cleanup after exception during connect
                     try:
                         await adapter.disconnect()
@@ -3336,24 +3508,6 @@ class GatewayRunner:
                             platform.value,
                             exc_info=True,
                         )
-
-                # Same defensive cleanup path for exceptions — an adapter
-                # that raised mid-connect may still have a live
-                # aiohttp.ClientSession or child subprocess.
-                await self._safe_adapter_disconnect(adapter, platform)
-                self._update_platform_runtime_status(
-                    platform.value,
-                    platform_state="retrying",
-                    error_code=None,
-                    error_message=str(e),
-                )
-                startup_retryable_errors.append(f"{platform.value}: {e}")
-                # Unexpected exceptions are typically transient — queue for retry
-                self._failed_platforms[platform] = {
-                    "config": platform_config,
-                    "attempts": 1,
-                    "next_retry": time.monotonic() + 30,
-                }
         
         if connected_count == 0:
             if startup_nonretryable_errors:
@@ -3474,7 +3628,7 @@ class GatewayRunner:
             logger.info(
                 "Starting reconnection watcher for %d failed platform(s): %s",
                 len(self._failed_platforms),
-                ", ".join(p.value for p in self._failed_platforms),
+                ", ".join(str(p.value if hasattr(p, "value") else p) for p in self._failed_platforms),
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
@@ -4149,36 +4303,42 @@ class GatewayRunner:
                 continue
 
             now = time.monotonic()
-            for platform in list(self._failed_platforms.keys()):
+            for failed_key in list(self._failed_platforms.keys()):
                 if not self._running:
                     return
-                info = self._failed_platforms[platform]
+                info = self._failed_platforms[failed_key]
+                platform = info.get("platform")
+                if platform is None:
+                    platform, inferred_bot_instance_id = self._failed_platform_parts(failed_key)
+                    info["platform"] = platform
+                    info.setdefault("bot_instance_id", inferred_bot_instance_id)
+                bot_instance_id = str(info.get("bot_instance_id") or "").strip() or None
                 if now < info["next_retry"]:
                     continue  # not time yet
 
                 if info["attempts"] >= _MAX_ATTEMPTS:
                     logger.warning(
                         "Giving up reconnecting %s after %d attempts",
-                        platform.value, info["attempts"],
+                        failed_key, info["attempts"],
                     )
-                    del self._failed_platforms[platform]
+                    del self._failed_platforms[failed_key]
                     continue
 
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
                 logger.info(
                     "Reconnecting %s (attempt %d/%d)...",
-                    platform.value, attempt, _MAX_ATTEMPTS,
+                    failed_key, attempt, _MAX_ATTEMPTS,
                 )
 
                 try:
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_adapter(platform, platform_config, instance_id=bot_instance_id)
                     if not adapter:
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
-                            platform.value,
+                            failed_key,
                         )
-                        del self._failed_platforms[platform]
+                        del self._failed_platforms[failed_key]
                         continue
 
                     adapter.set_message_handler(self._handle_message)
@@ -4188,17 +4348,18 @@ class GatewayRunner:
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
-                        self.adapters[platform] = adapter
+                        self._register_adapter(adapter)
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
-                        del self._failed_platforms[platform]
+                        self.delivery_router.platform_adapters = getattr(self, "_platform_adapters", {})
+                        del self._failed_platforms[failed_key]
                         self._update_platform_runtime_status(
-                            platform.value,
+                            self._adapter_instance_key(adapter),
                             platform_state="connected",
                             error_code=None,
                             error_message=None,
                         )
-                        logger.info("✓ %s reconnected successfully", platform.value)
+                        logger.info("✓ %s reconnected successfully", failed_key)
 
                         # Rebuild channel directory with the new adapter
                         try:
@@ -4210,19 +4371,19 @@ class GatewayRunner:
                         # Check if the failure is non-retryable
                         if adapter.has_fatal_error and not adapter.fatal_error_retryable:
                             self._update_platform_runtime_status(
-                                platform.value,
+                                self._adapter_instance_key(adapter),
                                 platform_state="fatal",
                                 error_code=adapter.fatal_error_code,
                                 error_message=adapter.fatal_error_message,
                             )
                             logger.warning(
                                 "Reconnect %s: non-retryable error (%s), removing from retry queue",
-                                platform.value, adapter.fatal_error_message,
+                                failed_key, adapter.fatal_error_message,
                             )
-                            del self._failed_platforms[platform]
+                            del self._failed_platforms[failed_key]
                         else:
                             self._update_platform_runtime_status(
-                                platform.value,
+                                self._failed_platform_key(platform, bot_instance_id),
                                 platform_state="retrying",
                                 error_code=adapter.fatal_error_code,
                                 error_message=adapter.fatal_error_message or "failed to reconnect",
@@ -4232,11 +4393,11 @@ class GatewayRunner:
                             info["next_retry"] = time.monotonic() + backoff
                             logger.info(
                                 "Reconnect %s failed, next retry in %ds",
-                                platform.value, backoff,
+                                failed_key, backoff,
                             )
                 except Exception as e:
                     self._update_platform_runtime_status(
-                        platform.value,
+                        self._failed_platform_key(platform, bot_instance_id),
                         platform_state="retrying",
                         error_code=None,
                         error_message=str(e),
@@ -4246,7 +4407,7 @@ class GatewayRunner:
                     info["next_retry"] = time.monotonic() + backoff
                     logger.warning(
                         "Reconnect %s error: %s, next retry in %ds",
-                        platform.value, e, backoff,
+                        failed_key, e, backoff,
                     )
 
             # Check every 10 seconds for platforms that need reconnection
@@ -4315,15 +4476,21 @@ class GatewayRunner:
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
+            restart_scope_bot_id = None
+            try:
+                restart_source = self._load_restart_notification_source()
+                restart_scope_bot_id = self._source_bot_instance_id(restart_source)
+            except Exception:
+                restart_scope_bot_id = None
+            await self._notify_active_sessions_of_shutdown(bot_instance_id=restart_scope_bot_id)
 
             timeout = self._restart_drain_timeout
-            active_agents, timed_out = await self._drain_active_agents(timeout)
+            active_agents, timed_out = await self._drain_active_agents(timeout, bot_instance_id=restart_scope_bot_id)
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
                     timeout,
-                    self._running_agent_count(),
+                    self._running_agent_count(bot_instance_id=restart_scope_bot_id),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -4349,7 +4516,7 @@ class GatewayRunner:
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
-                for _sk, _agent in list(self._running_agents.items()):
+                for _sk, _agent in self._iter_running_agents(bot_instance_id=restart_scope_bot_id):
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
@@ -4360,10 +4527,11 @@ class GatewayRunner:
                             _sk, _e,
                         )
                 self._interrupt_running_agents(
-                    _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+                    bot_instance_id=restart_scope_bot_id,
                 )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
-                while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
+                while self._running_agent_count(bot_instance_id=restart_scope_bot_id) and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
 
@@ -4972,7 +5140,7 @@ class GatewayRunner:
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
-        adapter = self.adapters.get(source.platform)
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return
 
@@ -5084,7 +5252,7 @@ class GatewayRunner:
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
@@ -5094,7 +5262,7 @@ class GatewayRunner:
                             f"`hermes pairing approve {platform_name} {code}`"
                         )
                 else:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
@@ -5342,7 +5510,7 @@ class GatewayRunner:
                 queued_text = event.get_command_args().strip()
                 if not queued_text:
                     return "Usage: /queue <prompt>"
-                adapter = self.adapters.get(source.platform)
+                adapter = self._adapter_for_source(source)
                 if adapter:
                     queued_event = MessageEvent(
                         text=queued_text,
@@ -5352,7 +5520,7 @@ class GatewayRunner:
                         channel_prompt=event.channel_prompt,
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
-                depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
+                depth = self._queue_depth(_quick_key, adapter=adapter)
                 if depth <= 1:
                     return "Queued for the next turn."
                 return f"Queued for the next turn. ({depth} queued)"
@@ -5369,7 +5537,7 @@ class GatewayRunner:
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._adapter_for_source(source)
                     if adapter:
                         queued_event = MessageEvent(
                             text=steer_text,
@@ -5391,7 +5559,7 @@ class GatewayRunner:
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
                     return "Steer rejected (empty payload)."
                 # Running agent is missing or lacks steer() — fall back to queue.
-                adapter = self.adapters.get(source.platform)
+                adapter = self._adapter_for_source(source)
                 if adapter:
                     queued_event = MessageEvent(
                         text=steer_text,
@@ -5491,7 +5659,7 @@ class GatewayRunner:
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self.adapters.get(source.platform)
+                adapter = self._adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
                 return None
@@ -5512,7 +5680,7 @@ class GatewayRunner:
                     time.time() - _started_at,
                     _quick_key,
                 )
-                adapter = self.adapters.get(source.platform)
+                adapter = self._adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(
                         adapter._pending_messages,
@@ -5532,7 +5700,7 @@ class GatewayRunner:
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self.adapters.get(source.platform)
+                adapter = self._adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(
                         adapter._pending_messages,
@@ -6075,7 +6243,7 @@ class GatewayRunner:
                     "VOICE_TOOLS_OPENAI_KEY",
                 )
                 if any(marker in message_text for marker in _stt_fail_markers):
-                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_adapter = self._adapter_for_source(source)
                     _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
                     if _stt_adapter:
                         try:
@@ -6179,7 +6347,7 @@ class GatewayRunner:
                     allowed_root=_msg_cwd,
                 )
                 if _ctx_result.blocked:
-                    _adapter = self.adapters.get(source.platform)
+                    _adapter = self._adapter_for_source(source)
                     if _adapter:
                         await _adapter.send(
                             source.chat_id,
@@ -7075,7 +7243,7 @@ class GatewayRunner:
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
-                        "model": _resolve_gateway_model(),
+                        "model": _resolve_gateway_model(source=source),
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
                     }
@@ -7244,7 +7412,7 @@ class GatewayRunner:
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        model = _resolve_gateway_model(source=source)
         config_context_length = None
         provider = None
         base_url = None
@@ -7607,7 +7775,7 @@ class GatewayRunner:
         is_running = session_key in self._running_agents
 
         # Count pending /queue follow-ups (slot + overflow).
-        adapter = self.adapters.get(source.platform) if source else None
+        adapter = self._adapter_for_source(source) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
         title = None
@@ -7818,14 +7986,12 @@ class GatewayRunner:
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
         try:
-            notify_data = {
-                "platform": event.source.platform.value if event.source.platform else None,
-                "chat_id": event.source.chat_id,
-            }
-            if event.source.thread_id:
-                notify_data["thread_id"] = event.source.thread_id
-            if event.source.bot_instance_id:
-                notify_data["bot_instance_id"] = event.source.bot_instance_id
+            notify_data = build_restart_target_payload(
+                platform=event.source.platform,
+                chat_id=event.source.chat_id,
+                thread_id=event.source.thread_id,
+                bot_instance_id=self._source_bot_instance_id(event.source),
+            )
             atomic_json_write(
                 _hermes_home / ".restart_notify.json",
                 notify_data,
@@ -7840,12 +8006,14 @@ class GatewayRunner:
         # marker persists so the new gateway can still detect a delayed
         # /restart redelivery from Telegram.  Overwritten on every /restart.
         try:
-            dedup_data = {
-                "platform": event.source.platform.value if event.source.platform else None,
-                "requested_at": time.time(),
-            }
-            if event.platform_update_id is not None:
-                dedup_data["update_id"] = event.platform_update_id
+            dedup_data = build_restart_target_payload(
+                platform=event.source.platform,
+                chat_id=event.source.chat_id,
+                thread_id=event.source.thread_id,
+                bot_instance_id=self._source_bot_instance_id(event.source),
+                requested_at=time.time(),
+                update_id=event.platform_update_id,
+            )
             atomic_json_write(
                 _hermes_home / ".restart_last_processed.json",
                 dedup_data,
@@ -7900,11 +8068,23 @@ class GatewayRunner:
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
                 return False
-            data = json.loads(marker_path.read_text())
+            data = load_restart_target_payload(marker_path)
         except Exception:
+            return False
+        if not data:
             return False
 
         if data.get("platform") != platform_value:
+            return False
+        if str(data.get("chat_id") or "") != str(event.source.chat_id or ""):
+            return False
+        marker_thread_id = str(data.get("thread_id") or "")
+        event_thread_id = str(getattr(event.source, "thread_id", None) or "")
+        if marker_thread_id != event_thread_id:
+            return False
+        marker_bot_instance_id = str(normalize_bot_instance_id(data.get("bot_instance_id")) or "")
+        event_bot_instance_id = str(self._source_bot_instance_id(event.source) or "")
+        if marker_bot_instance_id != event_bot_instance_id:
             return False
         recorded_uid = data.get("update_id")
         if not isinstance(recorded_uid, int):
@@ -8597,7 +8777,7 @@ class GatewayRunner:
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
-        adapter = self.adapters.get(source.platform)
+        adapter = self._adapter_for_source(source)
         if not adapter:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
             return
@@ -8624,7 +8804,7 @@ class GatewayRunner:
         exactly this boundary; when unavailable, fall back to direct awaited
         delivery rather than silently dropping the notice.
         """
-        adapter = self.adapters.get(source.platform)
+        adapter = self._adapter_for_source(source)
         if not adapter:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
             return
@@ -8712,7 +8892,7 @@ class GatewayRunner:
         # Enqueue via the adapter's FIFO so a user message already in
         # flight preempts the continuation naturally.
         try:
-            adapter = self.adapters.get(source.platform)
+            adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
                 cont_event = MessageEvent(
@@ -8820,9 +9000,10 @@ class GatewayRunner:
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         platform = event.source.platform
-        voice_key = self._voice_key(platform, chat_id)
+        bot_instance_id = self._source_bot_instance_id(event.source)
+        voice_key = self._voice_key(platform, chat_id, bot_instance_id)
 
-        adapter = self.adapters.get(platform)
+        adapter = self._adapter_for_source(event.source)
 
         if args in ("on", "enable"):
             self._voice_mode[voice_key] = "voice_only"
@@ -8861,7 +9042,7 @@ class GatewayRunner:
                 "all": "TTS (voice reply to all messages)",
             }
             # Append voice channel info if connected
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._adapter_for_source(event.source)
             guild_id = self._get_guild_id(event)
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)
@@ -9403,7 +9584,7 @@ class GatewayRunner:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
-        adapter = self.adapters.get(source.platform)
+        adapter = self._adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
@@ -9666,7 +9847,7 @@ class GatewayRunner:
         self._service_tier = self._load_service_tier()
 
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
+        model = _resolve_gateway_model(user_config, source=event.source)
         if not model_supports_fast_mode(model):
             return "⚡ /fast is only available for OpenAI models that support Priority Processing."
 
@@ -9874,7 +10055,7 @@ class GatewayRunner:
             # Show a preview using current agent state if available.
             from gateway.runtime_footer import format_runtime_footer
             preview = format_runtime_footer(
-                model=_resolve_gateway_model(user_config) or None,
+                model=_resolve_gateway_model(user_config, source=event.source) or None,
                 context_tokens=0,
                 context_length=None,
                 fields=effective.get("fields") or ["model", "context_pct", "cwd"],
@@ -11849,11 +12030,13 @@ class GatewayRunner:
             return None
 
         try:
-            data = json.loads(notify_path.read_text())
+            data = load_restart_target_payload(notify_path)
+            if not data:
+                return None
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
-            bot_instance_id = data.get("bot_instance_id")
+            bot_instance_id = normalize_bot_instance_id(data.get("bot_instance_id"))
 
             if not platform_str or not chat_id:
                 return None
@@ -12004,6 +12187,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            bot_instance_id=str(context.source.bot_instance_id) if getattr(context.source, "bot_instance_id", None) else "",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -14827,7 +15011,7 @@ class GatewayRunner:
             _result_for_fb = result_holder[0]
             _run_failed = _result_for_fb.get("failed") if _result_for_fb else False
             if _agent is not None and hasattr(_agent, 'model') and not _run_failed:
-                _cfg_model = _resolve_gateway_model()
+                _cfg_model = _resolve_gateway_model(source=source)
                 if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
                     # Fallback activated on a successful run — evict cached
                     # agent so the next message retries the primary model.

@@ -811,12 +811,35 @@ class APIServerAdapter(BasePlatformAdapter):
         — matching the semantics of the native gateway's ``session_key``.
         """
         from run_agent import AIAgent
-        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
+        from gateway.run import (
+            _resolve_runtime_agent_kwargs,
+            _resolve_gateway_model,
+            _load_gateway_config,
+            GatewayRunner,
+            _parse_session_key,
+        )
+        from gateway.config import Platform
+        from gateway.session import SessionSource
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+
+        source: Optional[SessionSource] = None
+        if gateway_session_key:
+            parsed_session = _parse_session_key(gateway_session_key)
+            bot_instance_id = None
+            if isinstance(parsed_session, dict):
+                bot_instance_id = parsed_session.get("bot_instance_id")
+            if bot_instance_id:
+                source = SessionSource(
+                    platform=Platform.API_SERVER,
+                    chat_id=gateway_session_key,
+                    chat_type="api",
+                    bot_instance_id=str(bot_instance_id),
+                )
+
+        model = _resolve_gateway_model(source=source)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))

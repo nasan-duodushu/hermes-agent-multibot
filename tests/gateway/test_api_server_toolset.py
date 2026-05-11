@@ -99,6 +99,33 @@ class TestApiServerAdapterToolset:
             assert call_kwargs.kwargs.get("platform") == "api_server"
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_passes_bot_instance_source_from_gateway_session_key(self):
+        """Bot-aware gateway_session_key should flow into gateway model resolution."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model") as mock_model, \
+             patch("gateway.run._load_gateway_config") as mock_config, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+
+            mock_kwargs.return_value = {"api_key": "test-key", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {}
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent(gateway_session_key="agent:alpha:api_server:api:client-1")
+
+            mock_model.assert_called_once()
+            source = mock_model.call_args.kwargs.get("source")
+            assert source is not None
+            assert source.bot_instance_id == "alpha"
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_respects_config_override(self):
         """User can override API server toolsets via platform_toolsets in config.yaml."""
         from gateway.platforms.api_server import APIServerAdapter
