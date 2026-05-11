@@ -907,7 +907,14 @@ def _resolve_gateway_model(config: dict | None = None, source: Optional[SessionS
                             bot_cfg = item
                             break
         if isinstance(bot_cfg, dict):
-            bot_model = bot_cfg.get("model") or bot_cfg.get("default_model") or ""
+            bot_extra = bot_cfg.get("extra") if isinstance(bot_cfg.get("extra"), dict) else {}
+            bot_model = (
+                bot_cfg.get("model")
+                or bot_cfg.get("default_model")
+                or (bot_extra or {}).get("llm_model")
+                or (bot_extra or {}).get("llm_default_model")
+                or ""
+            )
             if isinstance(bot_model, str) and bot_model.strip():
                 return bot_model.strip()
     if isinstance(model_cfg, str):
@@ -1668,6 +1675,86 @@ class GatewayRunner:
             session_id=session_entry.session_id,
         )
 
+    def _lookup_per_bot_model(self, source) -> str:
+        """Read per-bot LLM model name from telegram.bots[<bot_instance_id>].extra.
+
+        Looks for extras.llm_model first, then extras.llm_default_model.
+        Returns the empty string when the bot has no per-bot model set
+        (so the caller can keep the globally-resolved model).
+
+        Companion to _lookup_per_bot_backend. Needed because
+        _resolve_gateway_model reads bots[] from the raw yaml dict, so it
+        misses bots that were loaded via TELEGRAM_BOTS_JSON env into the
+        dataclass only.
+        """
+        if not source:
+            return ""
+        bot_id = str(getattr(source, "bot_instance_id", "") or "").strip()
+        if not bot_id:
+            return ""
+        try:
+            from gateway.config import Platform, TelegramPlatformConfig
+        except Exception:
+            return ""
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return ""
+        telegram_cfg = self.config.platforms.get(Platform.TELEGRAM)
+        if not isinstance(telegram_cfg, TelegramPlatformConfig):
+            return ""
+        for bot in telegram_cfg.bots:
+            if getattr(bot, "id", None) == bot_id:
+                extra = getattr(bot, "extra", None) or {}
+                for key in ("llm_model", "llm_default_model"):
+                    value = extra.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                return ""
+        return ""
+
+    def _lookup_per_bot_backend(self, source) -> dict:
+        """Read per-bot LLM backend overrides from telegram.bots[<bot_instance_id>].extra.
+
+        Supported keys: base_url, api_key, provider, api_mode.
+        Returns an empty dict when source has no bot_instance_id,
+        when the platform is not Telegram, when no matching bot is
+        configured, or when extra carries no override fields.
+
+        Used by _resolve_session_agent_runtime() to give each bot
+        in a multi-bot hermes instance its own LLM backend.
+        """
+        if not source:
+            return {}
+        bot_id = str(getattr(source, "bot_instance_id", "") or "").strip()
+        if not bot_id:
+            return {}
+        try:
+            from gateway.config import Platform, TelegramPlatformConfig
+            telegram_cfg = self.config.platforms.get(Platform.TELEGRAM)
+        except Exception:
+            return {}
+        if not isinstance(telegram_cfg, TelegramPlatformConfig):
+            return {}
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return {}
+        for bot in telegram_cfg.bots:
+            if getattr(bot, "id", None) == bot_id:
+                extra = getattr(bot, "extra", None) or {}
+                out: dict = {}
+                # Read `llm_*` namespaced keys to avoid colliding with
+                # gateway/platforms/telegram.py which reads `extra.base_url`
+                # as a custom Telegram Bot API server endpoint.
+                for canonical, src_key in (
+                    ("base_url", "llm_base_url"),
+                    ("api_key", "llm_api_key"),
+                    ("provider", "llm_provider"),
+                    ("api_mode", "llm_api_mode"),
+                ):
+                    value = extra.get(src_key)
+                    if isinstance(value, str) and value.strip():
+                        out[canonical] = value.strip()
+                return out
+        return {}
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -1689,6 +1776,17 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config, source=source)
+        # Phase 3-lite per-bot model fallback. _resolve_gateway_model only
+        # finds bots[] inside the raw yaml dict; bots loaded via
+        # TELEGRAM_BOTS_JSON env into the dataclass are invisible to it.
+        # Read the per-bot model from the dataclass and override.
+        if source is not None:
+            try:
+                _bot_model_override = self._lookup_per_bot_model(source)
+            except Exception:
+                _bot_model_override = ""
+            if _bot_model_override:
+                model = _bot_model_override
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -1750,6 +1848,20 @@ class GatewayRunner:
                     )
             except Exception:
                 pass
+
+        # Per-bot LLM backend override (Phase 3-lite). When no session-scoped
+        # /model override is active, apply per-bot extras from
+        # telegram.bots[<bot_instance_id>].extra.{base_url,api_key,provider,api_mode}.
+        # Session-scoped overrides take precedence over per-bot ones; per-bot
+        # takes precedence over the global default runtime.
+        if not override and source is not None:
+            try:
+                bot_overrides = self._lookup_per_bot_backend(source)
+            except Exception:
+                bot_overrides = {}
+            for _k, _v in bot_overrides.items():
+                if _v:
+                    runtime_kwargs[_k] = _v
 
         return model, runtime_kwargs
 
