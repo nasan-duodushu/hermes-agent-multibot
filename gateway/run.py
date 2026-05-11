@@ -3448,6 +3448,45 @@ class GatewayRunner:
                         logger.info("✓ %s connected", platform.value)
                     else:
                         logger.warning("✗ %s failed to connect", platform.value)
+                        # Adapter signalled failure via _set_fatal_error()
+                        # instead of raising. Mirror the except-branch so
+                        # retryable startup errors still get queued for
+                        # background reconnection and surface a meaningful
+                        # exit_reason (regression fix: multi-bot fan-out
+                        # introduced this path; without this block the
+                        # error message is silently dropped).
+                        fatal_message = getattr(adapter, "fatal_error_message", None)
+                        fatal_code = getattr(adapter, "fatal_error_code", None)
+                        fatal_retryable = bool(getattr(adapter, "fatal_error_retryable", True))
+                        if fatal_message:
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="fatal",
+                                error_code=fatal_code,
+                                error_message=fatal_message,
+                            )
+                            if fatal_retryable:
+                                failed_key = self._failed_platform_key(platform, instance_id)
+                                self._failed_platforms[failed_key] = {
+                                    "config": platform_config,
+                                    "attempts": 0,
+                                    "next_retry": time.monotonic() + 30,
+                                    "platform": platform,
+                                    "bot_instance_id": instance_id,
+                                }
+                                logger.info(
+                                    "%s queued for background reconnection after startup failure",
+                                    failed_key,
+                                )
+                                self._update_platform_runtime_status(
+                                    failed_key,
+                                    platform_state="retrying",
+                                    error_code=fatal_code,
+                                    error_message=fatal_message,
+                                )
+                                startup_retryable_errors.append(f"{failed_key}: {fatal_message}")
+                            else:
+                                startup_nonretryable_errors.append(f"{platform.value}: {fatal_message}")
                         # Defensive cleanup: a failed connect() may have
                         # allocated resources (aiohttp.ClientSession, poll
                         # tasks, bridge subprocesses) before giving up.

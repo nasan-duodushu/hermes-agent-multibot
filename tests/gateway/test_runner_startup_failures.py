@@ -74,7 +74,7 @@ async def test_runner_returns_failure_for_retryable_startup_errors(monkeypatch, 
     )
     runner = GatewayRunner(config)
 
-    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config: _RetryableFailureAdapter())
+    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config, **kwargs: _RetryableFailureAdapter())
 
     ok = await runner.start()
 
@@ -118,7 +118,7 @@ async def test_runner_records_connected_platform_state_on_success(monkeypatch, t
     )
     runner = GatewayRunner(config)
 
-    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config: _SuccessfulAdapter())
+    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config, **kwargs: _SuccessfulAdapter())
     monkeypatch.setattr(runner.hooks, "discover_and_load", lambda: None)
     monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
 
